@@ -48,6 +48,11 @@ static bool agent_parse_bool_default(const char *s, bool def);
  * used to render sampled assistant text and DSML tool calls as they arrive.
  */
 
+/* Seconds between periodic session autosaves.  A KV payload is large (tens to
+ * hundreds of MB), so this throttles writes rather than saving every turn; the
+ * interval bounds how much work a crash can cost. */
+#define AGENT_AUTOSAVE_INTERVAL_SECONDS 300
+
 typedef struct {
     const char *prompt;
     const char *system;
@@ -55,6 +60,7 @@ typedef struct {
     bool raw_prompt;
     int n_predict;
     int ctx_size;
+    int autosave_interval;
     float temperature;
     float top_p;
     float min_p;
@@ -115,6 +121,9 @@ typedef struct {
     char *legacy_session_path_to_delete;
     bool user_activity;
     bool session_dirty;
+    double last_autosave_at;
+    bool autosave_pending;
+    bool autosave_requested;
     pthread_t thread;
     pthread_mutex_t mu;
     pthread_cond_t cond;
@@ -454,6 +463,18 @@ static void agent_input_buf_free(agent_input_buf *b) {
     memset(b, 0, sizeof(*b));
 }
 
+/* Like parse_int(), but accepts 0 so options can use it as an explicit
+ * "disabled" value. */
+static int parse_int_nonneg(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT32_MAX) {
+        fprintf(stderr, "ds4-agent: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
 static int parse_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
@@ -571,6 +592,7 @@ static agent_config parse_options(int argc, char **argv) {
             .system = "You are a helpful coding assistant running inside ds4-agent.",
             .n_predict = 50000,
             .ctx_size = 100000,
+            .autosave_interval = AGENT_AUTOSAVE_INTERVAL_SECONDS,
             .temperature = DS4_DEFAULT_TEMPERATURE,
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
@@ -614,6 +636,9 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
             c.gen.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--autosave-interval")) {
+            c.gen.autosave_interval =
+                parse_int_nonneg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
@@ -8931,6 +8956,52 @@ static void worker_run_deferred_save(agent_worker *w) {
     agent_set_status(w, AGENT_WORKER_IDLE);
 }
 
+/* Periodic session autosave.  Only ever runs on the worker thread, at points
+ * where the live KV already matches the transcript, so the save costs a write
+ * and no resync.  Failures are traced rather than published: an autosave is a
+ * background convenience and must not interrupt the conversation. */
+static void worker_run_autosave(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->autosave_pending = false;
+    w->autosave_requested = false;
+    pthread_mutex_unlock(&w->mu);
+
+    if (!agent_worker_needs_save(w)) return;
+
+    agent_set_status(w, AGENT_WORKER_SAVING);
+    char err[160] = {0};
+    char sha[41] = {0};
+    int tokens = 0;
+    double t0 = now_sec();
+    bool ok = agent_worker_save_session_now(w, sha, &tokens, err, sizeof(err));
+    /* Stamp the attempt rather than the success, so a failing disk is retried
+     * once per interval instead of on every turn. */
+    w->last_autosave_at = now_sec();
+    if (ok)
+        agent_trace(w, "autosave session %.8s tokens=%d %.3f ms", sha, tokens,
+                    (w->last_autosave_at - t0) * 1000.0);
+    else
+        agent_trace(w, "autosave failed: %s", err[0] ? err : "unknown error");
+    agent_set_status(w, AGENT_WORKER_IDLE);
+}
+
+/* Called at turn end.  Saves when the interval has elapsed, otherwise records
+ * that a save is owed so the idle wait can flush it once the interval passes.
+ * last_autosave_at is worker-thread-only state and needs no lock. */
+static void worker_note_autosave(agent_worker *w) {
+    if (w->cfg->gen.autosave_interval <= 0) return;
+    if (!agent_worker_needs_save(w)) return;
+    if (w->last_autosave_at != 0.0 &&
+        now_sec() - w->last_autosave_at < (double)w->cfg->gen.autosave_interval)
+    {
+        pthread_mutex_lock(&w->mu);
+        w->autosave_pending = true;
+        pthread_mutex_unlock(&w->mu);
+        return;
+    }
+    worker_run_autosave(w);
+}
+
 static void worker_run_deferred_compact(agent_worker *w) {
     if (!worker_take_compact_requested(w)) return;
     if (!agent_worker_has_user_session(w)) {
@@ -8988,8 +9059,33 @@ static void *worker_main(void *arg) {
     while (true) {
         pthread_mutex_lock(&w->mu);
         while (!w->stop && !w->cmd_text && !w->save_requested &&
-               !w->compact_requested && !w->power_requested)
-            pthread_cond_wait(&w->cond, &w->mu);
+               !w->compact_requested && !w->power_requested &&
+               !w->autosave_requested)
+        {
+            if (!w->autosave_pending || w->cfg->gen.autosave_interval <= 0) {
+                pthread_cond_wait(&w->cond, &w->mu);
+                continue;
+            }
+            /* A turn-end autosave was throttled.  Wait out the rest of the
+             * interval so an idle session still reaches disk instead of
+             * sitting unsaved until the next turn or exit. */
+            double remaining = (double)w->cfg->gen.autosave_interval -
+                               (now_sec() - w->last_autosave_at);
+            if (remaining <= 0.0) {
+                w->autosave_requested = true;
+                continue;
+            }
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += (time_t)remaining;
+            ts.tv_nsec += (long)((remaining - (double)(time_t)remaining) * 1e9);
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000L;
+            }
+            if (pthread_cond_timedwait(&w->cond, &w->mu, &ts) == ETIMEDOUT)
+                w->autosave_requested = true;
+        }
         if (w->stop) {
             pthread_mutex_unlock(&w->mu);
             break;
@@ -9009,6 +9105,11 @@ static void *worker_main(void *arg) {
             worker_run_deferred_compact(w);
             continue;
         }
+        if (!w->cmd_text && w->autosave_requested) {
+            pthread_mutex_unlock(&w->mu);
+            worker_run_autosave(w);
+            continue;
+        }
         char *cmd = w->cmd_text;
         w->cmd_text = NULL;
         pthread_mutex_unlock(&w->mu);
@@ -9021,6 +9122,7 @@ static void *worker_main(void *arg) {
         worker_apply_pending_power(w);
         worker_run_deferred_compact(w);
         worker_run_deferred_save(w);
+        worker_note_autosave(w);
     }
 
     agent_set_status(w, AGENT_WORKER_STOPPED);

@@ -306,6 +306,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--raw-prompt", "Non-interactive -p only: tokenize prompt without agent chat/tool text.");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
+    opt(fp, c, "--autosave-interval N", "Seconds between session autosaves. 0 disables. Default: 300");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     fputc('\n', fp);
 }
