@@ -273,3 +273,107 @@ kernel void kernel_argsort_merge_f32_i32(
 
 // Host-visible merge variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
+
+// DSpark fused Markov-bias argmax (Metal port of the CUDA
+// dspark_markov_argmax_kernel). For one draft position it computes
+// argmax_v(logits[v] + W2[v]·(d1*W1[prev])) over the vocab without reading
+// the 129k-float logits row back to the CPU. W1 row and W2 are Q8_0
+// (34-byte blocks: half scale + 32 int8). Two-stage reduction instead of the
+// CUDA 64-bit atomicMax: stage 1 writes one packed key per threadgroup,
+// stage 2 reduces the partial keys. The key packing is the CUDA one —
+// monotonic float bits in the high word, ~index in the low word, so
+// numeric max resolves ties to the smaller index.
+struct ds4_metal_args_dspark_markov {
+    uint32_t vocab;
+    uint32_t rank_blocks;
+    uint32_t n_part;
+};
+
+static inline ulong dspark_markov_pack_key(float v, uint i) {
+    const uint f = as_type<uint>(v);
+    const uint fkey = (f & 0x80000000u) ? ~f : (f | 0x80000000u);
+    return ((ulong)fkey << 32) | (uint)(~i);
+}
+
+kernel void kernel_dspark_markov_argmax_part(
+        constant ds4_metal_args_dspark_markov & args,
+        device const float * logits,
+        device const uchar * w1_row,
+        device const uchar * w2,
+        device       ulong * partials,
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        uint3  tgpg  [[threadgroups_per_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]]) {
+    constexpr uint NT = 256;
+    threadgroup float state[256];
+    threadgroup float vals[NT];
+    threadgroup uint  idxs[NT];
+    const uint tid = tiitg;
+
+    if (tid < args.rank_blocks * 32u) {
+        const uint b = tid >> 5, k = tid & 31u;
+        device const uchar *blk = w1_row + (ulong)b * 34u;
+        const float d = (float)(*(device const half *)blk);
+        state[tid] = d * (float)((device const char *)(blk + 2))[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float best_v = -INFINITY;
+    uint  best_i = 0u;
+    for (uint i = tgpig.x * NT + tid; i < args.vocab; i += tgpg.x * NT) {
+        device const uchar *row = w2 + (ulong)i * args.rank_blocks * 34u;
+        float acc = 0.0f;
+        for (uint b = 0; b < args.rank_blocks; b++) {
+            device const uchar *blk = row + (ulong)b * 34u;
+            const float d = (float)(*(device const half *)blk);
+            /* 34-byte Q8_0 blocks leave the quants 2 mod 4: packed_char4
+             * (1-byte alignment) is required — a char4 load here is UB. */
+            device const packed_char4 *q4 = (device const packed_char4 *)(blk + 2);
+            float4 s4 = float4(0.0f);
+            FOR_UNROLL (uint k = 0; k < 8u; k++) {
+                s4 += float4(char4(q4[k])) * float4(state[b*32u + k*4u + 0u],
+                                                    state[b*32u + k*4u + 1u],
+                                                    state[b*32u + k*4u + 2u],
+                                                    state[b*32u + k*4u + 3u]);
+            }
+            acc += d * (s4.x + s4.y + s4.z + s4.w);
+        }
+        const float v = logits[i] + acc;
+        if (v > best_v || (v == best_v && i < best_i)) { best_v = v; best_i = i; }
+    }
+
+    vals[tid] = best_v;
+    idxs[tid] = best_i;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = NT/2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            const float ov = vals[tid + stride];
+            const uint  oi = idxs[tid + stride];
+            if (ov > vals[tid] || (ov == vals[tid] && oi < idxs[tid])) {
+                vals[tid] = ov;
+                idxs[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) partials[tgpig.x] = dspark_markov_pack_key(vals[0], idxs[0]);
+}
+
+kernel void kernel_dspark_markov_argmax_final(
+        constant ds4_metal_args_dspark_markov & args,
+        device const ulong * partials,
+        device       ulong * out_key,
+        ushort tiitg [[thread_index_in_threadgroup]]) {
+    constexpr uint NT = 128;
+    threadgroup ulong keys[NT];
+    const uint tid = tiitg;
+    ulong best = 0;
+    for (uint i = tid; i < args.n_part; i += NT) best = max(best, partials[i]);
+    keys[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = NT/2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) keys[tid] = max(keys[tid], keys[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) out_key[0] = keys[0];
+}

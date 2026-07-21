@@ -32093,9 +32093,9 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
         }
 
         int32_t token = -1;
-#ifndef __APPLE__
-        /* CUDA can apply the Markov bias and argmax without reading back the
-         * full logits row. Metal currently falls through to the CPU path. */
+        /* CUDA and Metal apply the Markov bias and argmax on-device without
+         * reading back the full logits row; ROCm returns 0 and falls through
+         * to the CPU path below. */
         if (ok && !dspark_markov_bias_disabled() &&
             getenv("DS4_DSPARK_NO_GPU_MARKOV") == NULL &&
             g->dspark_draft_tokens &&
@@ -32125,6 +32125,23 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
             ds4_gpu_tensor_free(row_view);
             const uint32_t gpu_token = ~(uint32_t)(gpu_key & 0xffffffffu);
             if (gpu_ok && gpu_key != 0 && gpu_token < DS4_N_VOCAB) {
+                if (getenv("DS4_DSPARK_VERIFY_GPU_MARKOV") != NULL) {
+                    uint32_t cpu_token = 0;
+                    if (ds4_gpu_tensor_read(g->spec_logits,
+                                            (uint64_t)draft * logits_bytes,
+                                            logits,
+                                            logits_bytes) != 0 &&
+                        dspark_markov_q8_0_argmax(&cpu_token,
+                                                  dspark_model,
+                                                  final->markov_w2,
+                                                  markov_state,
+                                                  logits)) {
+                        fprintf(stderr,
+                                "ds4: dspark markov xcheck gpu=%u cpu=%u %s\n",
+                                gpu_token, cpu_token,
+                                gpu_token == cpu_token ? "MATCH" : "MISMATCH");
+                    }
+                }
                 token = (int32_t)gpu_token;
                 proposal[draft] = token;
                 produced = draft + 1u;
@@ -32133,7 +32150,6 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
                 continue;
             }
         }
-#endif
         if (ok) {
             ok = ds4_gpu_tensor_read(g->spec_logits,
                                      (uint64_t)draft * logits_bytes,

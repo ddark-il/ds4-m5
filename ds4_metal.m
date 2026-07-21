@@ -285,6 +285,7 @@ static id<MTLBuffer> g_router_weight_sum_buffer;
 static id<MTLBuffer> g_indexer_head_scores_buffer;
 static id<MTLBuffer> g_indexer_topk_buffer;
 static id<MTLBuffer> g_indexed_topk_buffer;
+static id<MTLBuffer> g_dspark_markov_part_buffer;
 static id<MTLBuffer> g_f16_round_scratch_buffer;
 static id<MTLBuffer> g_raw_store_round_buffer;
 static id<MTLBuffer> g_moe_gate_scratch_buffer;
@@ -479,6 +480,7 @@ static NSUInteger g_router_weight_sum_bytes;
 static NSUInteger g_indexer_head_scores_bytes;
 static NSUInteger g_indexer_topk_bytes;
 static NSUInteger g_indexed_topk_bytes;
+static NSUInteger g_dspark_markov_part_bytes;
 static NSUInteger g_f16_round_scratch_bytes;
 static NSUInteger g_raw_store_round_bytes;
 static NSUInteger g_moe_gate_scratch_bytes;
@@ -9222,6 +9224,7 @@ void ds4_gpu_cleanup(void) {
         g_indexer_head_scores_buffer = nil;
         g_indexer_topk_buffer = nil;
         g_indexed_topk_buffer = nil;
+        g_dspark_markov_part_buffer = nil;
         g_stream_expert_validate_status_buffer = nil;
         g_f16_round_scratch_buffer = nil;
         g_raw_store_round_buffer = nil;
@@ -9263,6 +9266,7 @@ void ds4_gpu_cleanup(void) {
         g_router_weight_sum_bytes = 0;
         g_indexer_head_scores_bytes = 0;
         g_indexer_topk_bytes = 0;
+        g_dspark_markov_part_bytes = 0;
         g_indexed_topk_bytes = 0;
         g_f16_round_scratch_bytes = 0;
         g_raw_store_round_bytes = 0;
@@ -16127,6 +16131,105 @@ int ds4_gpu_argmax_tensor(
     }
 
     return ds4_gpu_indexer_topk_tensor(out_idx, logits, n_vocab, 1, 1);
+}
+
+/*
+ * DSpark fused Markov-bias argmax (Metal counterpart of the CUDA entry
+ * point). Applies the low-rank Markov bias W2·(d*W1[prev]) to one on-GPU
+ * draft-logits row and writes the packed argmax key to out_idx, so the CPU
+ * reads back 8 bytes instead of the 129k-float logits row plus an 8.8 MB
+ * W2 matvec. Same validation and key packing as ds4_cuda.cu.
+ */
+int ds4_gpu_dspark_markov_argmax_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits_row,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              w1_offset,
+        uint64_t              w2_offset,
+        uint32_t              prev_token,
+        uint32_t              vocab,
+        uint32_t              rank) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out_idx || !logits_row || !model_map || vocab == 0 ||
+        rank == 0 || (rank & 31u) != 0u || rank > 256u ||
+        ds4_gpu_tensor_bytes(out_idx) < sizeof(uint64_t) ||
+        ds4_gpu_tensor_bytes(logits_row) < (uint64_t)vocab * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t rank_blocks = rank / 32u;
+    const uint64_t row_bytes = (uint64_t)rank_blocks * 34u;
+    if (w1_offset > model_size ||
+        (uint64_t)prev_token * row_bytes + row_bytes > model_size - w1_offset ||
+        w2_offset > model_size ||
+        (uint64_t)vocab * row_bytes > model_size - w2_offset) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> part_pipeline =
+            ds4_gpu_get_pipeline("kernel_dspark_markov_argmax_part");
+        id<MTLComputePipelineState> final_pipeline =
+            ds4_gpu_get_pipeline("kernel_dspark_markov_argmax_final");
+        if (!part_pipeline || !final_pipeline) return 0;
+
+        id<MTLBuffer> logitsbuf = ds4_gpu_tensor_buffer(logits_row);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out_idx);
+        uint64_t w1_inner = 0, w2_inner = 0;
+        id<MTLBuffer> w1buf = ds4_gpu_wrap_model_range(model_map,
+                                                       model_size,
+                                                       w1_offset + (uint64_t)prev_token * row_bytes,
+                                                       row_bytes,
+                                                       &w1_inner);
+        id<MTLBuffer> w2buf = ds4_gpu_wrap_model_range(model_map,
+                                                       model_size,
+                                                       w2_offset,
+                                                       (uint64_t)vocab * row_bytes,
+                                                       &w2_inner);
+        if (!logitsbuf || !outbuf || !w1buf || !w2buf) return 0;
+
+        const uint32_t n_part = 128;
+        if (!ds4_gpu_ensure_scratch_buffer(&g_dspark_markov_part_buffer,
+                                             &g_dspark_markov_part_bytes,
+                                             (NSUInteger)(n_part * sizeof(uint64_t)),
+                                             "ds4_dspark_markov_part")) {
+            return 0;
+        }
+
+        struct {
+            uint32_t vocab;
+            uint32_t rank_blocks;
+            uint32_t n_part;
+        } args = { vocab, rank_blocks, n_part };
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:part_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:logitsbuf offset:ds4_gpu_tensor_offset(logits_row) atIndex:1];
+        [enc setBuffer:w1buf offset:(NSUInteger)w1_inner atIndex:2];
+        [enc setBuffer:w2buf offset:(NSUInteger)w2_inner atIndex:3];
+        [enc setBuffer:g_dspark_markov_part_buffer offset:0 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(n_part, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:final_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:g_dspark_markov_part_buffer offset:0 atIndex:1];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_idx) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "dspark markov argmax")) return 0;
+    }
+
+    return 1;
 }
 
 int ds4_gpu_dsv4_topk_mask_tensor(
