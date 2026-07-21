@@ -7832,7 +7832,10 @@ kernel void kernel_mul_mm_id_iq2_xxs_mpp(
 // float4 activation gather, in-register SwiGLU on the matching gate/up
 // cooperative-tensor layouts (one 16 KiB scratch instead of two). Same
 // routing/gather/scatter + epilogue math as kernel_mul_mm_id_pair_swiglu_f16_impl.
-kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_mpp(
+// Templated over the weight quant: any 256-wide block type whose dequant is
+// still compute-bound at the expert shape qualifies (IQ2_XXS, Q4_K).
+template<typename block_q, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mul_mm_id_pair_swiglu_mpp_impl(
         constant ds4_metal_args_mul_mm_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
         device const char * src0_gate,
@@ -7896,10 +7899,10 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_mpp(
         for (int w = tiitg; w < NR0*NL; w += NT) {
             const int row = w/NL, kc = w%NL, kp = lk + kc*16, kb = kc*16;
             if (r0 + row < M) {
-                device const block_iq2_xxs *xb =
-                    (device const block_iq2_xxs *)(src + args.nb01*(r0 + row) + offset0);
+                device const block_q *xb =
+                    (device const block_q *)(src + args.nb01*(r0 + row) + offset0);
                 half4x4 t;
-                dequantize_iq2_xxs(xb + kp/256, (kp/16)%16, t);
+                dequantize_func(xb + kp/256, (kp/16)%16, t);
                 threadgroup half4 *d4 = (threadgroup half4 *)(buf + row*NK + kb);
                 d4[0] = t[0]; d4[1] = t[1]; d4[2] = t[2]; d4[3] = t[3];
             } else {
@@ -7965,6 +7968,11 @@ kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_mpp(
         }
     }
 }
+
+typedef decltype(kernel_mul_mm_id_pair_swiglu_mpp_impl<block_iq2_xxs, dequantize_iq2_xxs>) mul_mm_id_pair_swiglu_mpp_iq2;
+typedef decltype(kernel_mul_mm_id_pair_swiglu_mpp_impl<block_q4_K, dequantize_q4_K>) mul_mm_id_pair_swiglu_mpp_q4;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_mpp")]] kernel mul_mm_id_pair_swiglu_mpp_iq2 kernel_mul_mm_id_pair_swiglu_mpp_impl<block_iq2_xxs, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_mpp")]] kernel mul_mm_id_pair_swiglu_mpp_q4 kernel_mul_mm_id_pair_swiglu_mpp_impl<block_q4_K, dequantize_q4_K>;
 
 // Attention-output low-rank projection retained for Metal4 prefill.  It uses
 // the same direct-RHS idea as dense matmul: dequantize the Q8_0 low projection

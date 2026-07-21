@@ -37637,16 +37637,20 @@ int ds4_gpu_routed_moe_batch_tensor(
                         "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
             }
             /* Neural-Accelerator fused pair-swiglu: default-on for IQ2_XXS
-             * gate/up when the Metal 4 tensor API is available — measured
-             * +10-11% prefill vs the simdgroup fused kernel on M5 Max
-             * (interleaved A/B, drift-cancelling ratio). Kill switch:
+             * and Q4_K gate/up when the Metal 4 tensor API is available —
+             * measured +10-11% prefill vs the simdgroup fused kernel on M5
+             * Max for IQ2 (interleaved A/B, drift-cancelling ratio); Q4_K is
+             * the same compute-bound template. Kill switch:
              * DS4_METAL_DISABLE_MOE_PAIR_SWIGLU_MPP. */
             if (use_mm_id_pair_swiglu &&
-                gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+                (gate_type == DS4_METAL_TENSOR_IQ2_XXS ||
+                 gate_type == DS4_METAL_TENSOR_Q4_K) &&
                 g_metal4_tensor_api_enabled &&
                 getenv("DS4_METAL_DISABLE_MOE_PAIR_SWIGLU_MPP") == NULL) {
                 pair_swiglu_mpp_pipeline =
-                    ds4_gpu_get_pipeline("kernel_mul_mm_id_iq2_xxs_pair_swiglu_mpp");
+                    ds4_gpu_get_pipeline(gate_type == DS4_METAL_TENSOR_Q4_K ?
+                        "kernel_mul_mm_id_q4_K_pair_swiglu_mpp" :
+                        "kernel_mul_mm_id_iq2_xxs_pair_swiglu_mpp");
             }
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline ||
                 (use_mm_id_pair_swiglu && !pair_swiglu_mm_pipeline)) {
