@@ -28281,6 +28281,63 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
     return 1;
 }
 
+/*
+ * Neural-Accelerator dispatch of the fused IQ2 gate+up pair-SwiGLU (default
+ * when the Metal 4 tensor API is available; kill switch
+ * DS4_METAL_DISABLE_MOE_PAIR_SWIGLU_MPP). Same buffer layout as the simdgroup
+ * pair-swiglu encode, but the mpp kernel uses a 64-token square tile (grid.x
+ * /64) and a 16 KiB threadgroup: 12.5 KiB of staging tiles during the k-loop,
+ * then one NR0*NR1 float scratch for the combined SwiGLU result (the gate/up
+ * cooperative tensors are combined in-register before the store).
+ */
+static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_mpp(
+        id<MTLCommandBuffer>        cb,
+        id<MTLComputePipelineState> pipeline,
+        const ds4_gpu_mul_mm_id_args *mm_args,
+        const ds4_gpu_dsv4_moe_swiglu_weight_args *act_args,
+        id<MTLBuffer>               gate_src0,
+        NSUInteger                  gate_src0_off,
+        id<MTLBuffer>               up_src0,
+        NSUInteger                  up_src0_off,
+        id<MTLBuffer>               src1,
+        NSUInteger                  src1_off,
+        id<MTLBuffer>               mid,
+        NSUInteger                  mid_off,
+        id<MTLBuffer>               weights,
+        NSUInteger                  weights_off) {
+    if (!cb || !pipeline || !mm_args || !act_args ||
+        !gate_src0 || !up_src0 || !src1 || !mid || !weights ||
+        !g_moe_id_map_buffer ||
+        mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
+        mm_args->ne20 <= 0 || mm_args->ne21 <= 0 || mm_args->ne02 <= 0) {
+        return 0;
+    }
+    const NSUInteger tpe_bytes = (NSUInteger)mm_args->ne02 * sizeof(int32_t);
+    const NSUInteger hids_bytes = (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne21 * sizeof(int32_t);
+    if (tpe_bytes > NSUIntegerMax - hids_bytes ||
+        g_moe_id_map_bytes < tpe_bytes + hids_bytes) {
+        return 0;
+    }
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:mm_args length:sizeof(*mm_args) atIndex:0];
+    [enc setBytes:act_args length:sizeof(*act_args) atIndex:1];
+    [enc setBuffer:gate_src0 offset:gate_src0_off atIndex:2];
+    [enc setBuffer:up_src0 offset:up_src0_off atIndex:3];
+    [enc setBuffer:src1 offset:src1_off atIndex:4];
+    [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:5];
+    [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:6];
+    [enc setBuffer:mid offset:mid_off atIndex:7];
+    [enc setBuffer:weights offset:weights_off atIndex:8];
+    [enc setThreadgroupMemoryLength:16384u atIndex:0]; /* NR0*NR1 float epilogue scratch dominates (staging is 12.5 KB) */
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + 63u) / 64u,
+                                          ((NSUInteger)mm_args->ne0 + 63u) / 64u,
+                                          (NSUInteger)mm_args->ne02)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static int ds4_gpu_encode_mul_mm_id_mapped(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> mm_pipeline,
@@ -37297,6 +37354,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         id<MTLComputePipelineState> gate_up_mpp_pipeline = nil;   /* opt-in nax IQ2 expert GEMM */
         id<MTLComputePipelineState> down_mm_pipeline = nil;
         id<MTLComputePipelineState> pair_swiglu_mm_pipeline = nil;
+        id<MTLComputePipelineState> pair_swiglu_mpp_pipeline = nil;   /* opt-in fused nax pair-swiglu */
         if (gate_nr0 == 0 || down_nr0 == 0 || !gate_mv_pipeline || !down_mv_pipeline) {
             fprintf(stderr, "ds4: unsupported Metal routed batch MoE quant types gate=%u down=%u\n",
                     gate_type, down_type);
@@ -37474,6 +37532,18 @@ int ds4_gpu_routed_moe_batch_tensor(
                     ds4_gpu_get_pipeline(gate_type == DS4_METAL_TENSOR_Q4_K ?
                         "kernel_mul_mm_id_q4_K_pair_swiglu_f16" :
                         "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+            }
+            /* Neural-Accelerator fused pair-swiglu: default-on for IQ2_XXS
+             * gate/up when the Metal 4 tensor API is available — measured
+             * +10-11% prefill vs the simdgroup fused kernel on M5 Max
+             * (interleaved A/B, drift-cancelling ratio). Kill switch:
+             * DS4_METAL_DISABLE_MOE_PAIR_SWIGLU_MPP. */
+            if (use_mm_id_pair_swiglu &&
+                gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+                g_metal4_tensor_api_enabled &&
+                getenv("DS4_METAL_DISABLE_MOE_PAIR_SWIGLU_MPP") == NULL) {
+                pair_swiglu_mpp_pipeline =
+                    ds4_gpu_get_pipeline("kernel_mul_mm_id_iq2_xxs_pair_swiglu_mpp");
             }
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline ||
                 (use_mm_id_pair_swiglu && !pair_swiglu_mm_pipeline)) {
@@ -37834,21 +37904,39 @@ int ds4_gpu_routed_moe_batch_tensor(
                     .write_clamped = 0,
                     .clamp_value = clamp,
                 };
-                ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
-                                                                   pair_swiglu_mm_pipeline,
-                                                                   &gate_mm_args,
-                                                                   &act_args,
-                                                                   gate_buf,
-                                                                   (NSUInteger)gate_inner,
-                                                                   up_buf,
-                                                                   (NSUInteger)up_inner,
-                                                                   xbuf,
-                                                                   ds4_gpu_tensor_offset(x),
-                                                                   midbuf,
-                                                                   ds4_gpu_tensor_offset(mid),
-                                                                   weightsbuf,
-                                                                   ds4_gpu_tensor_offset(weights));
-                DS4_METAL_PROFILE_MOE_STAGE("gate_up_fused");
+                if (pair_swiglu_mpp_pipeline && gate_mm_args.nb10 == sizeof(float)) {
+                    ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_mpp(cb,
+                                                                       pair_swiglu_mpp_pipeline,
+                                                                       &gate_mm_args,
+                                                                       &act_args,
+                                                                       gate_buf,
+                                                                       (NSUInteger)gate_inner,
+                                                                       up_buf,
+                                                                       (NSUInteger)up_inner,
+                                                                       xbuf,
+                                                                       ds4_gpu_tensor_offset(x),
+                                                                       midbuf,
+                                                                       ds4_gpu_tensor_offset(mid),
+                                                                       weightsbuf,
+                                                                       ds4_gpu_tensor_offset(weights));
+                    DS4_METAL_PROFILE_MOE_STAGE("gate_up_fused_mpp");
+                } else {
+                    ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
+                                                                       pair_swiglu_mm_pipeline,
+                                                                       &gate_mm_args,
+                                                                       &act_args,
+                                                                       gate_buf,
+                                                                       (NSUInteger)gate_inner,
+                                                                       up_buf,
+                                                                       (NSUInteger)up_inner,
+                                                                       xbuf,
+                                                                       ds4_gpu_tensor_offset(x),
+                                                                       midbuf,
+                                                                       ds4_gpu_tensor_offset(mid),
+                                                                       weightsbuf,
+                                                                       ds4_gpu_tensor_offset(weights));
+                    DS4_METAL_PROFILE_MOE_STAGE("gate_up_fused");
+                }
             } else if (ok && gate_up_mpp_pipeline) {
                 ok = ds4_gpu_encode_mul_mm_id_mpp(cb,
                                                   gate_up_mpp_pipeline,

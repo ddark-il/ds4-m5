@@ -7824,6 +7824,148 @@ kernel void kernel_mul_mm_id_iq2_xxs_mpp(
     }
 }
 
+// Fused nax pair-SwiGLU: gate+up matmul2d sharing one gathered activation tile,
+// SwiGLU epilogue -> mid. Beats the fused simdgroup pair-swiglu by ~10-11%
+// prefill on M5 Max (interleaved A/B); the separate-projection mpp path loses
+// to it, so this fused form is the production Apple10 path. The wins over the
+// naive port: loop-invariant gather offsets hoisted out of the k-loop (boff),
+// float4 activation gather, in-register SwiGLU on the matching gate/up
+// cooperative-tensor layouts (one 16 KiB scratch instead of two). Same
+// routing/gather/scatter + epilogue math as kernel_mul_mm_id_pair_swiglu_f16_impl.
+kernel void kernel_mul_mm_id_iq2_xxs_pair_swiglu_mpp(
+        constant ds4_metal_args_mul_mm_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device const char * htpe,
+        device const char * hids,
+        device       char * dst_mid,
+        device const char * weights,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int NR0 = 64, NR1 = 64, NK = 32, NL = NK/16, NT = 128;
+    const int K = args.ne00;
+    const int M = args.ne0;              /* expert mid dim */
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+    device const uint32_t * tpe = (device const uint32_t *) htpe;
+    device const int32_t  * ids = (device const int32_t  *) hids;
+    const int neh1 = tpe[im];
+    if (r1 >= neh1) return;
+    if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) return;
+    const short nr0 = (M - r0 < NR0) ? (short)(M - r0) : (short)NR0;
+    const short nr1 = (neh1 - r1 < NR1) ? (short)(neh1 - r1) : (short)NR1;
+
+    threadgroup half *sa_gate = (threadgroup half *) shmem;   /* [NK x NR0] */
+    threadgroup half *sa_up   = sa_gate + NR0*NK;             /* [NK x NR0] */
+    threadgroup half *sb      = sa_up + NR0*NK;               /* [NK x NR1] */
+    // Loop-invariant activation-row byte offsets for the gathered B columns;
+    // lives past the 12 KB staging tiles, overlapping the (post-loop) epilogue
+    // scratch region, so it adds no threadgroup footprint.
+    threadgroup ulong *boff   = (threadgroup ulong *)(sb + NR1*NK);
+    for (int col = tiitg; col < NR1; col += NT) {
+        ulong off = 0;
+        if (col < nr1) {
+            const int id = ids[im*args.ne21 + r1 + col];
+            const int i11 = (id % args.ne20) % args.ne11;
+            const int i12 = (id / args.ne20);
+            off = (ulong)args.nb12*i12 + (ulong)args.nb11*i11;
+        }
+        boff[col] = off;
+    }
+    auto tAg = tensor(sa_gate, dextents<int32_t, 2>(NK, NR0));
+    auto tAu = tensor(sa_up,   dextents<int32_t, 2>(NK, NR0));
+    auto tB  = tensor(sb,      dextents<int32_t, 2>(NK, NR1));
+    matmul2d<matmul2d_descriptor(NR1, NR0, NK, false, true, false,
+             matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<4>> mmg;
+    matmul2d<matmul2d_descriptor(NR1, NR0, NK, false, true, false,
+             matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<4>> mmu;
+    auto cTg = mmg.template get_destination_cooperative_tensor<decltype(tB), decltype(tAg), float>();
+    auto cTu = mmu.template get_destination_cooperative_tensor<decltype(tB), decltype(tAu), float>();
+    for (uint16_t i = 0; i < cTg.get_capacity(); ++i) {
+        if (cTg.is_valid_element(i)) cTg[i] = 0.0f;
+        if (cTu.is_valid_element(i)) cTu[i] = 0.0f;
+    }
+    const uint64_t offset0 = (uint64_t)(im - args.tp_expert_base)*args.nb02;
+    auto stageW = [&](device const char *src, int lk, threadgroup half *buf) {
+        for (int w = tiitg; w < NR0*NL; w += NT) {
+            const int row = w/NL, kc = w%NL, kp = lk + kc*16, kb = kc*16;
+            if (r0 + row < M) {
+                device const block_iq2_xxs *xb =
+                    (device const block_iq2_xxs *)(src + args.nb01*(r0 + row) + offset0);
+                half4x4 t;
+                dequantize_iq2_xxs(xb + kp/256, (kp/16)%16, t);
+                threadgroup half4 *d4 = (threadgroup half4 *)(buf + row*NK + kb);
+                d4[0] = t[0]; d4[1] = t[1]; d4[2] = t[2]; d4[3] = t[3];
+            } else {
+                FOR_UNROLL (short i = 0; i < 16; i++) buf[row*NK + kb + i] = (half)0;
+            }
+        }
+    };
+    // IQ2 rows are whole 256-wide blocks, so K % NK == 0 always holds and the
+    // k bound check is dropped. float4 gather assumes contiguous activations
+    // (nb10 == sizeof(float)), which the routed-MoE dispatch guarantees.
+    auto stageB = [&](int lk) {
+        for (int w = tiitg; w < NR1*(NK/4); w += NT) {
+            const int col = w/(NK/4), k4 = (w%(NK/4))*4;
+            half4 v = half4((half)0);
+            if (col < nr1) {
+                v = half4(*(device const float4 *)(src1 + boff[col] + (uint64_t)(lk + k4)*args.nb10));
+            }
+            *(threadgroup half4 *)(sb + col*NK + k4) = v;
+        }
+    };
+    threadgroup_barrier(mem_flags::mem_threadgroup);   /* boff visible */
+    stageW(src0_gate, 0, sa_gate); stageW(src0_up, 0, sa_up); stageB(0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int lk = 0; lk < K; lk += NK) {
+        auto mB = tB.slice(0, 0);
+        auto mAg = tAg.slice(0, 0);
+        auto mAu = tAu.slice(0, 0);
+        mmg.run(mB, mAg, cTg);
+        mmu.run(mB, mAu, cTu);
+        const int nk = lk + NK;
+        if (nk < K) { stageW(src0_gate, nk, sa_gate); stageW(src0_up, nk, sa_up); stageB(nk); }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // cTg/cTu share one cooperative-tensor layout (identical descriptor and
+    // operand types), so element i of both fragments maps to the same (m,n):
+    // the SwiGLU combine is elementwise in-register, and only ONE result tile
+    // round-trips through threadgroup memory. The per-column route weight is
+    // applied during the scatter. This halves the epilogue scratch to 16 KB,
+    // matching the production simd pair-swiglu's threadgroup footprint.
+    const float c = act.clamp_value;
+    for (uint16_t i = 0; i < cTg.get_capacity(); ++i) {
+        if (cTg.is_valid_element(i)) {
+            float g = cTg[i], u = cTu[i];
+            if (c > 1.0e-6f) { g = min(g, c); u = clamp(u, -c, c); }
+            cTg[i] = (g / (1.0f + exp(-g))) * u;
+        }
+    }
+    threadgroup float *temp_mid = (threadgroup float *) shmem;
+    auto tDm = tensor(temp_mid, dextents<int32_t, 2>(NR0, NR1), array<int, 2>({1, NR0}));
+    cTg.store(tDm);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short j = sgitg; j < nr1; j += 4) {
+        const int idj = ids[im*args.ne21 + r1 + j];
+        const short ide = idj % args.ne20, idt = idj / args.ne20;
+        device half *D = (device half *)(dst_mid +
+            ((uint64_t)idt*args.ne1 + (uint64_t)ide)*act.mid_row_stride) + r0;
+        device const float *wt = (device const float *)(weights + (uint64_t)idj*act.weight_stride);
+        const float route_weight = wt[0];
+        threadgroup float *Cm = temp_mid + j*NR0;
+        for (int i = tiisg; i < nr0; i += 32) {
+            D[i] = (half)(Cm[i] * route_weight);
+        }
+    }
+}
+
 // Attention-output low-rank projection retained for Metal4 prefill.  It uses
 // the same direct-RHS idea as dense matmul: dequantize the Q8_0 low projection
 // weights to a half tile, then let TensorOps read the dense head activations
