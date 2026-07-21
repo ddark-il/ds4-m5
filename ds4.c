@@ -4084,6 +4084,11 @@ typedef struct {
     ds4_tensor *ffn_gate_exps;
     ds4_tensor *ffn_up_exps;
     ds4_tensor *ffn_down_exps;
+    /* Optional hot-expert overlay slabs; see weights_bind_layer. */
+    ds4_tensor *ffn_gate_exps_hot;
+    ds4_tensor *ffn_up_exps_hot;
+    ds4_tensor *ffn_down_exps_hot;
+    ds4_tensor *ffn_hot_ids;
     ds4_tensor *ffn_gate_shexp;
     ds4_tensor *ffn_up_shexp;
     ds4_tensor *ffn_down_shexp;
@@ -5034,6 +5039,32 @@ static void weights_validate_layout(
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
         }
+        {
+            const bool any_hot = l->ffn_gate_exps_hot || l->ffn_up_exps_hot ||
+                                 l->ffn_down_exps_hot || l->ffn_hot_ids;
+            if (any_hot) {
+                if (!l->ffn_gate_exps_hot || !l->ffn_up_exps_hot ||
+                    !l->ffn_down_exps_hot || !l->ffn_hot_ids) {
+                    fprintf(stderr, "ds4: layer %u has a partial hot-expert overlay\n", il);
+                    exit(1);
+                }
+                if (l->ffn_hot_ids->type != DS4_TENSOR_I32 ||
+                    l->ffn_hot_ids->ndim != 1 ||
+                    l->ffn_hot_ids->dim[0] == 0 ||
+                    l->ffn_hot_ids->dim[0] > DS4_N_EXPERT) {
+                    fprintf(stderr, "ds4: layer %u ffn_hot_ids has invalid layout\n", il);
+                    exit(1);
+                }
+                const uint64_t n_hot = l->ffn_hot_ids->dim[0];
+                tensor_expect_routed_expert(l->ffn_gate_exps_hot, 3, DS4_N_EMBD, DS4_N_FF_EXP, n_hot);
+                tensor_expect_routed_expert(l->ffn_up_exps_hot,   3, DS4_N_EMBD, DS4_N_FF_EXP, n_hot);
+                tensor_expect_routed_expert(l->ffn_down_exps_hot, 3, DS4_N_FF_EXP, DS4_N_EMBD, n_hot);
+                if (l->ffn_gate_exps_hot->type != l->ffn_up_exps_hot->type) {
+                    fprintf(stderr, "ds4: hot gate/up experts use different quant types in layer %u\n", il);
+                    exit(1);
+                }
+            }
+        }
         tensor_expect_dense_quant_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
         tensor_expect_dense_quant_layout(l->ffn_up_shexp,   2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
         tensor_expect_dense_quant_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
@@ -5848,6 +5879,13 @@ static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_
     l->ffn_gate_exps   = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
     l->ffn_up_exps     = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
     l->ffn_down_exps   = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    /* Optional per-layer hot-expert overlay slabs (REAP-guided split): row h
+     * holds expert ffn_hot_ids[h] at the hot quant; those experts are masked
+     * out of the base tensors' dispatch. All four or none. */
+    l->ffn_gate_exps_hot = tensor_by_namef(m, "blk.%u.ffn_gate_exps_hot.weight", il);
+    l->ffn_up_exps_hot   = tensor_by_namef(m, "blk.%u.ffn_up_exps_hot.weight", il);
+    l->ffn_down_exps_hot = tensor_by_namef(m, "blk.%u.ffn_down_exps_hot.weight", il);
+    l->ffn_hot_ids       = tensor_by_namef(m, "blk.%u.ffn_hot_ids", il);
     l->ffn_gate_shexp  = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
     l->ffn_up_shexp    = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
     l->ffn_down_shexp  = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
@@ -28903,6 +28941,24 @@ static bool metal_graph_encode_layer_ffn_batch(
                                     (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
         }
     } else if (ok) {
+        ds4_gpu_hot_experts hot = {0};
+        if (layer->ffn_hot_ids) {
+            const uint64_t n_hot = layer->ffn_hot_ids->dim[0];
+            hot.n_hot = (uint32_t)n_hot;
+            hot.hot_ids = (const int32_t *)((const char *)model->map +
+                                            layer->ffn_hot_ids->abs_offset);
+            hot.gate_offset = layer->ffn_gate_exps_hot->abs_offset;
+            hot.up_offset = layer->ffn_up_exps_hot->abs_offset;
+            hot.down_offset = layer->ffn_down_exps_hot->abs_offset;
+            hot.gate_type = layer->ffn_gate_exps_hot->type;
+            hot.down_type = layer->ffn_down_exps_hot->type;
+            hot.gate_expert_bytes = layer->ffn_gate_exps_hot->bytes / n_hot;
+            hot.gate_row_bytes = layer->ffn_gate_exps_hot->bytes /
+                                 (n_hot * layer->ffn_gate_exps_hot->dim[1]);
+            hot.down_expert_bytes = layer->ffn_down_exps_hot->bytes / n_hot;
+            hot.down_row_bytes = layer->ffn_down_exps_hot->bytes /
+                                 (n_hot * layer->ffn_down_exps_hot->dim[1]);
+        }
         ok = ds4_gpu_routed_moe_batch_tensor(metal_graph_batch_routed_out(g),
                                                metal_graph_batch_routed_gate(g),
                                                metal_graph_batch_routed_up(g),
@@ -28931,7 +28987,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                il,
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16,
-                                               false) != 0;
+                                               false,
+                                               hot.n_hot ? &hot : NULL) != 0;
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_batch_routed_gate(g),
@@ -39769,7 +39826,8 @@ static int glm_graph_routed_moe_batch_dispatch(
                                                il,
                                                n_tokens,
                                                &g->batch_routed_mid_is_f16,
-                                               force_resident);
+                                               force_resident,
+                                               NULL);
     }
 
     if (direct_scalar_q4) {

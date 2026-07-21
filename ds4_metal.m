@@ -291,6 +291,8 @@ static id<MTLBuffer> g_raw_store_round_buffer;
 static id<MTLBuffer> g_moe_gate_scratch_buffer;
 static id<MTLBuffer> g_moe_down_scratch_buffer;
 static id<MTLBuffer> g_moe_id_map_buffer;
+static id<MTLBuffer> g_moe_hot_map_buffer;   /* compact hot-expert mini id-map */
+static id<MTLBuffer> g_moe_id_map_override;  /* hot pass: consumers bind this instead */
 static id<MTLBuffer> g_moe_q4_gate_slots_buffer;
 static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
@@ -486,6 +488,8 @@ static NSUInteger g_raw_store_round_bytes;
 static NSUInteger g_moe_gate_scratch_bytes;
 static NSUInteger g_moe_down_scratch_bytes;
 static NSUInteger g_moe_id_map_bytes;
+static NSUInteger g_moe_hot_map_bytes;
+static NSUInteger g_moe_id_map_override_bytes;
 static NSUInteger g_moe_q4_gate_slots_bytes;
 static NSUInteger g_moe_q4_up_slots_bytes;
 static NSUInteger g_moe_q4_down_slots_bytes;
@@ -4840,6 +4844,16 @@ static int ds4_gpu_encode_mul_mm_id(
         NSUInteger                  dst_off,
         id<MTLBuffer>               ids,
         NSUInteger                  ids_off);
+
+/* The hot-expert pass re-runs the mm_id consumers against a compact
+ * hot-only mini map (same [tpe][ids] layout, ne02 = n_hot). The override
+ * redirects the consumers' id-map binding for the duration of that pass. */
+static inline id<MTLBuffer> ds4_gpu_moe_map_buf(void) {
+    return g_moe_id_map_override ? g_moe_id_map_override : g_moe_id_map_buffer;
+}
+static inline NSUInteger ds4_gpu_moe_map_capacity(void) {
+    return g_moe_id_map_override ? g_moe_id_map_override_bytes : g_moe_id_map_bytes;
+}
 
 static int ds4_gpu_encode_mul_mm_id_map(
         id<MTLCommandBuffer>        cb,
@@ -9254,6 +9268,8 @@ void ds4_gpu_cleanup(void) {
         g_moe_gate_scratch_buffer = nil;
         g_moe_down_scratch_buffer = nil;
         g_moe_id_map_buffer = nil;
+        g_moe_hot_map_buffer = nil;
+        g_moe_id_map_override = nil;
         g_moe_q4_gate_slots_buffer = nil;
         g_moe_q4_up_slots_buffer = nil;
         g_moe_q4_down_slots_buffer = nil;
@@ -9296,6 +9312,8 @@ void ds4_gpu_cleanup(void) {
         g_moe_gate_scratch_bytes = 0;
         g_moe_down_scratch_bytes = 0;
         g_moe_id_map_bytes = 0;
+        g_moe_hot_map_bytes = 0;
+        g_moe_id_map_override_bytes = 0;
         g_moe_q4_gate_slots_bytes = 0;
         g_moe_q4_up_slots_bytes = 0;
         g_moe_q4_down_slots_bytes = 0;
@@ -28184,8 +28202,8 @@ static int ds4_gpu_encode_mul_mm_id_map(
     [enc setComputePipelineState:map_pipeline];
     [enc setBytes:map_args length:sizeof(*map_args) atIndex:0];
     [enc setBuffer:ids offset:ids_off atIndex:1];
-    [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:2];
-    [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:3];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:0 atIndex:2];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:tpe_bytes atIndex:3];
     [enc setThreadgroupMemoryLength:(NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne20 * sizeof(uint16_t) atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake((NSUInteger)mm_args->ne02, 1, 1)];
@@ -28205,7 +28223,7 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile(
         NSUInteger                  dst_off,
         NSUInteger                  threadgroup_bytes) {
     if (!cb || !mm_pipeline || !mm_args || !src0 || !src1 || !dst ||
-        !g_moe_id_map_buffer ||
+        !ds4_gpu_moe_map_buf() ||
         mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
         mm_args->ne20 <= 0 || mm_args->ne21 <= 0 || mm_args->ne02 <= 0) {
         return 0;
@@ -28223,7 +28241,7 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile(
     const NSUInteger tpe_bytes = (NSUInteger)mm_args->ne02 * sizeof(int32_t);
     const NSUInteger hids_bytes = (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne21 * sizeof(int32_t);
     if (tpe_bytes > NSUIntegerMax - hids_bytes ||
-        g_moe_id_map_bytes < tpe_bytes + hids_bytes) {
+        ds4_gpu_moe_map_capacity() < tpe_bytes + hids_bytes) {
         return 0;
     }
 
@@ -28232,8 +28250,8 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile(
     [enc setBytes:mm_args length:sizeof(*mm_args) atIndex:0];
     [enc setBuffer:src0 offset:src0_off atIndex:1];
     [enc setBuffer:src1 offset:src1_off atIndex:2];
-    [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:3];
-    [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:4];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:0 atIndex:3];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:tpe_bytes atIndex:4];
     [enc setBuffer:dst offset:dst_off atIndex:5];
     if (use_resource_hints) {
         [enc useResource:src0 usage:MTLResourceUsageRead];
@@ -28267,7 +28285,7 @@ static int ds4_gpu_encode_mul_mm_id_mpp(
         id<MTLBuffer>               dst,
         NSUInteger                  dst_off) {
     if (!cb || !mm_pipeline || !mm_args || !src0 || !src1 || !dst ||
-        !g_moe_id_map_buffer ||
+        !ds4_gpu_moe_map_buf() ||
         mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
         mm_args->ne20 <= 0 || mm_args->ne21 <= 0 || mm_args->ne02 <= 0) {
         return 0;
@@ -28277,7 +28295,7 @@ static int ds4_gpu_encode_mul_mm_id_mpp(
     const NSUInteger tpe_bytes = (NSUInteger)mm_args->ne02 * sizeof(int32_t);
     const NSUInteger hids_bytes = (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne21 * sizeof(int32_t);
     if (tpe_bytes > NSUIntegerMax - hids_bytes ||
-        g_moe_id_map_bytes < tpe_bytes + hids_bytes) {
+        ds4_gpu_moe_map_capacity() < tpe_bytes + hids_bytes) {
         return 0;
     }
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -28285,8 +28303,8 @@ static int ds4_gpu_encode_mul_mm_id_mpp(
     [enc setBytes:mm_args length:sizeof(*mm_args) atIndex:0];
     [enc setBuffer:src0 offset:src0_off atIndex:1];
     [enc setBuffer:src1 offset:src1_off atIndex:2];
-    [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:3];
-    [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:4];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:0 atIndex:3];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:tpe_bytes atIndex:4];
     [enc setBuffer:dst offset:dst_off atIndex:5];
     [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + tile_n - 1u) / tile_n,
@@ -28312,7 +28330,7 @@ static int ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
         uint32_t                    resource_kind,
         id<MTLBuffer>               overflow_resource) {
     if (!cb || !mm_pipeline || !mm_args || !src0_addrs || !src1 || !dst ||
-        !g_moe_id_map_buffer ||
+        !ds4_gpu_moe_map_buf() ||
         mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
         mm_args->ne20 <= 0 || mm_args->ne21 <= 0 || mm_args->ne02 <= 0) {
         return 0;
@@ -28323,7 +28341,7 @@ static int ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
     const NSUInteger hids_bytes =
         (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne21 * sizeof(int32_t);
     if (tpe_bytes > NSUIntegerMax - hids_bytes ||
-        g_moe_id_map_bytes < tpe_bytes + hids_bytes) {
+        ds4_gpu_moe_map_capacity() < tpe_bytes + hids_bytes) {
         return 0;
     }
 
@@ -28332,8 +28350,8 @@ static int ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
     [enc setBytes:mm_args length:sizeof(*mm_args) atIndex:0];
     [enc setBuffer:src0_addrs offset:0 atIndex:1];
     [enc setBuffer:src1 offset:src1_off atIndex:2];
-    [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:3];
-    [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:4];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:0 atIndex:3];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:tpe_bytes atIndex:4];
     [enc setBuffer:dst offset:dst_off atIndex:5];
     [enc useResource:src0_addrs usage:MTLResourceUsageRead];
     for (uint32_t i = 0; resources && i < resource_count; i++) {
@@ -28374,7 +28392,7 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
         NSUInteger                  weights_off) {
     if (!cb || !pipeline || !mm_args || !act_args ||
         !gate_src0 || !up_src0 || !src1 || !mid || !weights ||
-        !g_moe_id_map_buffer ||
+        !ds4_gpu_moe_map_buf() ||
         mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
         mm_args->ne20 <= 0 || mm_args->ne21 <= 0 || mm_args->ne02 <= 0) {
         return 0;
@@ -28383,7 +28401,7 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
     const NSUInteger tpe_bytes = (NSUInteger)mm_args->ne02 * sizeof(int32_t);
     const NSUInteger hids_bytes = (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne21 * sizeof(int32_t);
     if (tpe_bytes > NSUIntegerMax - hids_bytes ||
-        g_moe_id_map_bytes < tpe_bytes + hids_bytes) {
+        ds4_gpu_moe_map_capacity() < tpe_bytes + hids_bytes) {
         return 0;
     }
 
@@ -28394,8 +28412,8 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
     [enc setBuffer:gate_src0 offset:gate_src0_off atIndex:2];
     [enc setBuffer:up_src0 offset:up_src0_off atIndex:3];
     [enc setBuffer:src1 offset:src1_off atIndex:4];
-    [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:5];
-    [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:6];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:0 atIndex:5];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:tpe_bytes atIndex:6];
     [enc setBuffer:mid offset:mid_off atIndex:7];
     [enc setBuffer:weights offset:weights_off atIndex:8];
     [enc setThreadgroupMemoryLength:16384u atIndex:0];
@@ -28433,7 +28451,7 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_mpp(
         NSUInteger                  weights_off) {
     if (!cb || !pipeline || !mm_args || !act_args ||
         !gate_src0 || !up_src0 || !src1 || !mid || !weights ||
-        !g_moe_id_map_buffer ||
+        !ds4_gpu_moe_map_buf() ||
         mm_args->ne00 <= 0 || mm_args->ne0 <= 0 ||
         mm_args->ne20 <= 0 || mm_args->ne21 <= 0 || mm_args->ne02 <= 0) {
         return 0;
@@ -28441,7 +28459,7 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_mpp(
     const NSUInteger tpe_bytes = (NSUInteger)mm_args->ne02 * sizeof(int32_t);
     const NSUInteger hids_bytes = (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne21 * sizeof(int32_t);
     if (tpe_bytes > NSUIntegerMax - hids_bytes ||
-        g_moe_id_map_bytes < tpe_bytes + hids_bytes) {
+        ds4_gpu_moe_map_capacity() < tpe_bytes + hids_bytes) {
         return 0;
     }
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
@@ -28451,8 +28469,8 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_mpp(
     [enc setBuffer:gate_src0 offset:gate_src0_off atIndex:2];
     [enc setBuffer:up_src0 offset:up_src0_off atIndex:3];
     [enc setBuffer:src1 offset:src1_off atIndex:4];
-    [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:5];
-    [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:6];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:0 atIndex:5];
+    [enc setBuffer:ds4_gpu_moe_map_buf() offset:tpe_bytes atIndex:6];
     [enc setBuffer:mid offset:mid_off atIndex:7];
     [enc setBuffer:weights offset:weights_off atIndex:8];
     [enc setThreadgroupMemoryLength:16384u atIndex:0]; /* NR0*NR1 float epilogue scratch dominates (staging is 12.5 KB) */
@@ -37275,7 +37293,8 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16,
-        bool                    force_resident) {
+        bool                    force_resident,
+        const ds4_gpu_hot_experts *hot) {
     (void)force_resident;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* TP sharding (see ds4_gpu_routed_moe_one_tensor): bind from the owned
@@ -37555,6 +37574,17 @@ int ds4_gpu_routed_moe_batch_tensor(
             !use_iq2_batch_selected_addr &&
             n_tokens >= 32u &&
             ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
+        const uint32_t n_hot = (hot && hot->n_hot) ? hot->n_hot : 0u;
+        if (n_hot != 0 &&
+            (!use_mm_id || n_hot > n_total_expert || !hot->hot_ids ||
+             (NSUInteger)n_hot * sizeof(int32_t) > 4096 ||
+             g_tp_split_world > 1)) {
+            fprintf(stderr,
+                    "ds4: hot-expert overlay requires the mm_id prefill path "
+                    "(layer=%u tokens=%u n_hot=%u)\n",
+                    layer_index, n_tokens, n_hot);
+            return 0;
+        }
         /*
          * MTP verification is neither normal decode nor large prefill: the
          * target model must verify a tiny suffix (up to DSpark's 5-token
@@ -38023,6 +38053,45 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                 selectedbuf,
                                                 ds4_gpu_tensor_offset(selected));
             DS4_METAL_PROFILE_MOE_STAGE("map");
+            if (ok && n_hot != 0) {
+                /* Export the hot experts' token map into a compact mini map
+                 * (slab row h == dispatch index h) and zero their counts in
+                 * the base map so the cold pass skips them for free. */
+                const NSUInteger hot_tpe_bytes = (NSUInteger)n_hot * sizeof(int32_t);
+                const NSUInteger hot_ids_bytes =
+                    (NSUInteger)n_hot * (NSUInteger)gate_mm_args.ne21 * sizeof(int32_t);
+                id<MTLComputePipelineState> split_pipeline =
+                    ds4_gpu_get_pipeline("kernel_moe_hot_split_map");
+                ok = split_pipeline != nil &&
+                     ds4_gpu_ensure_scratch_buffer(&g_moe_hot_map_buffer,
+                                                     &g_moe_hot_map_bytes,
+                                                     hot_tpe_bytes + hot_ids_bytes,
+                                                     "ds4_moe_hot_map");
+                if (ok) {
+                    const NSUInteger tpe_bytes =
+                        (NSUInteger)gate_mm_args.ne02 * sizeof(int32_t);
+                    struct { uint32_t n_expert, n_hot, ne21; } split_args = {
+                        (uint32_t)gate_mm_args.ne02, n_hot, (uint32_t)gate_mm_args.ne21,
+                    };
+                    NSUInteger split_threads =
+                        (NSUInteger)n_hot * (NSUInteger)gate_mm_args.ne21;
+                    if (split_threads < (NSUInteger)gate_mm_args.ne02) {
+                        split_threads = (NSUInteger)gate_mm_args.ne02;
+                    }
+                    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                    [enc setComputePipelineState:split_pipeline];
+                    [enc setBytes:&split_args length:sizeof(split_args) atIndex:0];
+                    [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:1];
+                    [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:2];
+                    [enc setBytes:hot->hot_ids length:hot_tpe_bytes atIndex:3];
+                    [enc setBuffer:g_moe_hot_map_buffer offset:0 atIndex:4];
+                    [enc setBuffer:g_moe_hot_map_buffer offset:hot_tpe_bytes atIndex:5];
+                    [enc dispatchThreadgroups:MTLSizeMake((split_threads + 255u) / 256u, 1, 1)
+                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    ds4_gpu_end_compute_encoder(cb, enc);
+                }
+                DS4_METAL_PROFILE_MOE_STAGE("hot_split");
+            }
             if (ok && use_mm_id_pair_swiglu) {
                 ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
                     .width = expert_mid_dim,
@@ -38114,6 +38183,92 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                    ds4_gpu_tensor_offset(up),
                                                    8192u);
                 DS4_METAL_PROFILE_MOE_STAGE("up");
+            }
+            if (ok && n_hot != 0) {
+                /* Hot pass: the same mm_id consumers against the compact hot
+                 * mini map; the slab is dense so dispatch index == slab row. */
+                uint64_t hot_gate_inner = 0, hot_up_inner = 0;
+                id<MTLBuffer> hot_gate_buf = ds4_gpu_wrap_model_range(
+                        model_map, model_size, hot->gate_offset,
+                        (uint64_t)n_hot * hot->gate_expert_bytes, &hot_gate_inner);
+                id<MTLBuffer> hot_up_buf = ds4_gpu_wrap_model_range(
+                        model_map, model_size, hot->up_offset,
+                        (uint64_t)n_hot * hot->gate_expert_bytes, &hot_up_inner);
+                ok = hot_gate_buf != nil && hot_up_buf != nil;
+                ds4_gpu_mul_mm_id_args hot_mm_args = { 0 };
+                if (ok) {
+                    hot_mm_args = ds4_gpu_make_mul_mm_id_args(
+                            expert_in_dim, expert_mid_dim, n_hot,
+                            hot->gate_row_bytes, hot->gate_expert_bytes,
+                            1, n_expert, n_tokens);
+                    hot_mm_args.tp_rank = g_tp_split_rank;
+                    hot_mm_args.tp_world = g_tp_split_world;
+                    hot_mm_args.tp_expert_base = 0;
+                    g_moe_id_map_override = g_moe_hot_map_buffer;
+                    g_moe_id_map_override_bytes = g_moe_hot_map_bytes;
+                }
+                if (ok && use_mm_id_pair_swiglu) {
+                    ds4_gpu_dsv4_moe_swiglu_weight_args hot_act_args = {
+                        .width = expert_mid_dim,
+                        .rows = pair_rows,
+                        .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                        .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                        .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(uint16_t),
+                        .weight_stride = sizeof(float),
+                        .write_clamped = 0,
+                        .clamp_value = clamp,
+                    };
+                    id<MTLComputePipelineState> hot_pair_mpp = nil;
+                    if ((hot->gate_type == DS4_METAL_TENSOR_IQ2_XXS ||
+                         hot->gate_type == DS4_METAL_TENSOR_Q4_K) &&
+                        g_metal4_tensor_api_enabled &&
+                        getenv("DS4_METAL_DISABLE_MOE_PAIR_SWIGLU_MPP") == NULL) {
+                        hot_pair_mpp = ds4_gpu_get_pipeline(
+                                hot->gate_type == DS4_METAL_TENSOR_Q4_K ?
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_mpp" :
+                                "kernel_mul_mm_id_iq2_xxs_pair_swiglu_mpp");
+                    }
+                    if (hot_pair_mpp && hot_mm_args.nb10 == sizeof(float)) {
+                        ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_mpp(cb,
+                                hot_pair_mpp, &hot_mm_args, &hot_act_args,
+                                hot_gate_buf, (NSUInteger)hot_gate_inner,
+                                hot_up_buf, (NSUInteger)hot_up_inner,
+                                xbuf, ds4_gpu_tensor_offset(x),
+                                midbuf, ds4_gpu_tensor_offset(mid),
+                                weightsbuf, ds4_gpu_tensor_offset(weights));
+                    } else {
+                        id<MTLComputePipelineState> hot_pair_mm =
+                            ds4_gpu_get_pipeline(
+                                hot->gate_type == DS4_METAL_TENSOR_Q4_K ?
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16" :
+                                "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+                        ok = hot_pair_mm != nil &&
+                             ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
+                                hot_pair_mm, &hot_mm_args, &hot_act_args,
+                                hot_gate_buf, (NSUInteger)hot_gate_inner,
+                                hot_up_buf, (NSUInteger)hot_up_inner,
+                                xbuf, ds4_gpu_tensor_offset(x),
+                                midbuf, ds4_gpu_tensor_offset(mid),
+                                weightsbuf, ds4_gpu_tensor_offset(weights));
+                    }
+                } else if (ok) {
+                    id<MTLComputePipelineState> hot_mm =
+                        ds4_gpu_routed_mm_pipeline(hot->gate_type);
+                    ok = hot_mm != nil &&
+                         ds4_gpu_encode_mul_mm_id_mapped_tile(cb, hot_mm,
+                                &hot_mm_args,
+                                hot_gate_buf, (NSUInteger)hot_gate_inner,
+                                xbuf, ds4_gpu_tensor_offset(x),
+                                gatebuf, ds4_gpu_tensor_offset(gate), 8192u) &&
+                         ds4_gpu_encode_mul_mm_id_mapped_tile(cb, hot_mm,
+                                &hot_mm_args,
+                                hot_up_buf, (NSUInteger)hot_up_inner,
+                                xbuf, ds4_gpu_tensor_offset(x),
+                                upbuf, ds4_gpu_tensor_offset(up), 8192u);
+                }
+                g_moe_id_map_override = nil;
+                g_moe_id_map_override_bytes = 0;
+                DS4_METAL_PROFILE_MOE_STAGE("gate_up_hot");
             }
         } else if (use_tiny_pair_swiglu) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
@@ -38377,6 +38532,35 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        down_dst,
                                                        down_dst_off,
                                                        8192u);
+                if (ok && n_hot != 0) {
+                    uint64_t hot_down_inner = 0;
+                    id<MTLBuffer> hot_down_buf = ds4_gpu_wrap_model_range(
+                            model_map, model_size, hot->down_offset,
+                            (uint64_t)n_hot * hot->down_expert_bytes,
+                            &hot_down_inner);
+                    ds4_gpu_mul_mm_id_args hot_down_args =
+                        ds4_gpu_make_mul_mm_id_args_src1_size(
+                                expert_mid_dim, out_dim, n_hot,
+                                hot->down_row_bytes, hot->down_expert_bytes,
+                                n_expert, n_expert, n_tokens,
+                                request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
+                    hot_down_args.tp_rank = g_tp_split_rank;
+                    hot_down_args.tp_world = g_tp_split_world;
+                    hot_down_args.tp_expert_base = 0;
+                    id<MTLComputePipelineState> hot_down_mm = request_mid_f16 ?
+                        ds4_gpu_routed_mm_f16_rhs_pipeline(hot->down_type) :
+                        ds4_gpu_routed_mm_pipeline(hot->down_type);
+                    g_moe_id_map_override = g_moe_hot_map_buffer;
+                    g_moe_id_map_override_bytes = g_moe_hot_map_bytes;
+                    ok = hot_down_buf != nil && hot_down_mm != nil &&
+                         ds4_gpu_encode_mul_mm_id_mapped_tile(cb, hot_down_mm,
+                                &hot_down_args,
+                                hot_down_buf, (NSUInteger)hot_down_inner,
+                                midbuf, ds4_gpu_tensor_offset(mid),
+                                down_dst, down_dst_off, 8192u);
+                    g_moe_id_map_override = nil;
+                    g_moe_id_map_override_bytes = 0;
+                }
             } else {
                 ok = ds4_gpu_encode_mul_mv_id(cb,
                                                      down_mv_pipeline,

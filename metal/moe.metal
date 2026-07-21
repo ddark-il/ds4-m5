@@ -7806,6 +7806,9 @@ kernel void kernel_mul_mm_id_iq2_xxs_mpp(
         auto mA = (sel ? tA1 : tA0).slice(0, 0);
         auto mB = tB.slice(0, 0);
         mm.run(mB, mA, cT);
+        /* See the fused kernel: run() does not synchronize the threadgroup;
+         * restaging sb without a barrier is a data race. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         const int nk = lk + NK;
         if (nk < K) { sel ^= 1u; stageA(nk, sel ? sa + NR0*NK : sa); stageB(nk); }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -7932,6 +7935,10 @@ kernel void kernel_mul_mm_id_pair_swiglu_mpp_impl(
         auto mAu = tAu.slice(0, 0);
         mmg.run(mB, mAg, cTg);
         mmu.run(mB, mAu, cTu);
+        /* matmul2d.run does NOT fully synchronize the threadgroup: without
+         * this barrier the next staging races the tail of the cooperative
+         * matmul and the kernel is nondeterministic run-to-run. */
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         const int nk = lk + NK;
         if (nk < K) { stageW(src0_gate, nk, sa_gate); stageW(src0_up, nk, sa_up); stageB(nk); }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -8118,3 +8125,43 @@ template [[host_name("kernel_attn_out_low_q8_0_mpp_direct_rhs_n64")]] kernel att
 #undef N_R0_Q5_K
 #undef N_R0_Q6_K
 #undef N_R0_IQ2_XXS
+
+// Hot-expert overlay split map. After map0 builds the expert-major token map
+// (tpe counts + id slots per expert), this derives the two dispatch views:
+// a cold tpe copy with hot experts zeroed (the mm_id kernels early-out on
+// empty experts, so the base-tensor pass skips them for free), and compact
+// hot tpe/ids arrays where slab row h == dispatch index h, so the unchanged
+// mm_id kernels run directly on the dense hot slabs.
+struct ds4_metal_args_moe_hot_split {
+    uint32_t n_expert;   /* total experts in the base map */
+    uint32_t n_hot;
+    uint32_t ne21;       /* id slots per expert row */
+};
+
+kernel void kernel_moe_hot_split_map(
+        constant ds4_metal_args_moe_hot_split & args,
+        device uint32_t       * tpe,        /* hot counts zeroed in place */
+        device const int32_t  * ids,
+        constant int32_t      * hot_ids,
+        device uint32_t       * hot_tpe,    /* compact mini-map: [n_hot] counts */
+        device int32_t        * hot_ids_rows, /* then [n_hot x ne21] id slots  */
+        uint gid [[thread_position_in_grid]]) {
+    /* The thread owning expert gid both exports its count to the compact hot
+     * map and zeroes it in the base map, so the base-tensor pass skips hot
+     * experts without any encode changes. No other thread touches tpe[gid]. */
+    if (gid < args.n_expert) {
+        for (uint32_t h = 0; h < args.n_hot; h++) {
+            if ((uint32_t)hot_ids[h] == gid) {
+                hot_tpe[h] = tpe[gid];
+                tpe[gid] = 0u;
+                break;
+            }
+        }
+    }
+    /* Grid is sized max(n_expert, n_hot*ne21) by the host. */
+    const uint total = args.n_hot * args.ne21;
+    if (gid < total) {
+        const uint h = gid / args.ne21, j = gid % args.ne21;
+        hot_ids_rows[gid] = ids[(uint)hot_ids[h] * args.ne21 + j];
+    }
+}

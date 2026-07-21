@@ -2336,6 +2336,23 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                layer_index,
         bool                    force_resident);
 
+/* Optional per-layer hot-expert overlay (REAP-guided split): slabs holding
+ * the hot experts at a higher quant. Hot experts dispatch from the slab and
+ * are masked out of the base tensors' pass; ids keep their global meaning. */
+typedef struct {
+    uint32_t       n_hot;            /* 0 = no overlay */
+    const int32_t *hot_ids;          /* [n_hot] global expert ids, host memory */
+    uint64_t       gate_offset;      /* abs offsets of the hot slabs */
+    uint64_t       up_offset;
+    uint64_t       down_offset;
+    uint32_t       gate_type;        /* hot slab quant types */
+    uint32_t       down_type;
+    uint64_t       gate_expert_bytes;
+    uint64_t       gate_row_bytes;
+    uint64_t       down_expert_bytes;
+    uint64_t       down_row_bytes;
+} ds4_gpu_hot_experts;
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -2365,7 +2382,8 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                layer_index,
         uint32_t                n_tokens,
         bool                   *mid_is_f16,
-        bool                    force_resident);
+        bool                    force_resident,
+        const ds4_gpu_hot_experts *hot);
 
 /* =========================================================================
  * Hyper-Connection Kernels.
