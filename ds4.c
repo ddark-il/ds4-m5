@@ -32007,6 +32007,32 @@ static bool dspark_eval_confidence_probe(
     return true;
 }
 
+/* Opt-in (DS4_DSPARK_TAIL_SURVIVAL=<floor in (0,1]>) paper-style draft
+ * pruning on the cumulative survival probability a_j = prod(c_i) instead of
+ * the per-position confidence gate. Measured on M5 Max: the confidence head
+ * is well calibrated only at the top — the default marginal 0.9 gate
+ * self-truncates at almost exactly the full-accept boundary (accept 1.43,
+ * zero partials, +20% on nothink code), while survival-admitted tails
+ * mostly fail verification and each failure costs two extra passes (-20%
+ * in the same regime). Tail admission only gains ~+2% on low-acceptance
+ * thinking-mode prose, so it stays off by default. */
+static float dspark_tail_survival_threshold(void) {
+    static float cached = -1.0f;
+    if (cached < 0.0f) {
+        cached = 0.0f;   /* disabled: keep the marginal per-position gate */
+        const char *env = getenv("DS4_DSPARK_TAIL_SURVIVAL");
+        if (env && env[0]) {
+            const float v = strtof(env, NULL);
+            if (v > 0.0f && v <= 1.0f) cached = v;
+        }
+    }
+    return cached;
+}
+
+static bool dspark_tail_survival_disabled(void) {
+    return dspark_tail_survival_threshold() <= 0.0f;
+}
+
 static bool dspark_apply_markov_confidence_lazy_runtime(
         ds4_gpu_graph          *g,
         const ds4_model        *dspark_model,
@@ -32060,6 +32086,7 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
     int32_t prev_token = first_prev_token;
     uint32_t produced = 0;
     uint32_t confident = 0;
+    float survival = 1.0f;
     for (uint32_t draft = 0; ok && draft < dw->block_size; draft++) {
         if (prev_token < 0 || (uint32_t)prev_token >= DS4_N_VOCAB) {
             ok = false;
@@ -32087,9 +32114,19 @@ static bool dspark_apply_markov_confidence_lazy_runtime(
         }
         if (draft == 0 && confidence0) *confidence0 = confidence_logit;
         if (confidence_len) *confidence_len = draft + 1u;
-        if (sigmoid_stable(confidence_logit) < confidence_threshold) {
-            ok = true;
-            break;
+        const float conf_p = sigmoid_stable(confidence_logit);
+        if (draft == 0 || dspark_tail_survival_disabled()) {
+            if (conf_p < confidence_threshold) {
+                ok = true;
+                break;
+            }
+            survival = conf_p;
+        } else {
+            survival *= conf_p;
+            if (survival < dspark_tail_survival_threshold()) {
+                ok = true;
+                break;
+            }
         }
 
         int32_t token = -1;
@@ -60842,6 +60879,46 @@ static int ds4_session_eval_dspark_speculative_argmax(
     }
     const double replay_t0 = stats_enabled ? now_sec() : 0.0;
     int replayed_drafts = 0;
+    if (!tp_verify_sent && replay_budget >= 2) {
+        /* Batched replay: rebuild the accepted prefix with one verifier pass
+         * instead of replay_budget single-token decodes. The verifier's KV
+         * rows and row logits are the same state the full-accept path keeps,
+         * so this only changes the cost, not the result. TP keeps the
+         * lockstep single-token loop below. */
+        for (int i = 0; i < replay_budget; i++) {
+            token_vec_push(&s->checkpoint, drafts[i]);
+        }
+        ok = metal_graph_verify_suffix_tops(&s->graph,
+                                            &e->model,
+                                            &e->weights,
+                                            &s->checkpoint,
+                                            (uint32_t)start,
+                                            (uint32_t)replay_budget,
+                                            false,
+                                            true,
+                                            row_tops,
+                                            NULL,
+                                            NULL) &&
+             metal_graph_read_spec_logits_row(&s->graph,
+                                              (uint32_t)(replay_budget - 1),
+                                              row_logits);
+        if (!ok) {
+            snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
+            s->checkpoint_valid = false;
+            if (stats_enabled) {
+                s->dspark_stats.verifier_errors++;
+                s->dspark_stats.replay_ms += (now_sec() - replay_t0) * 1000.0;
+                ds4_dspark_stats_note_len(s->dspark_stats.accepted_len_hist, 0);
+            }
+            spec_frontier_free(&frontier);
+            DS4_DSPARK_STATS_FINISH();
+            return -1;
+        }
+        for (int i = 0; i < replay_budget; i++) {
+            accepted[n_accept++] = drafts[i];
+            replayed_drafts++;
+        }
+    } else {
     for (int i = 0; i < replay_budget; i++) {
         ok = metal_graph_eval_token_raw_swa(&s->graph,
                                             &e->model,
@@ -60865,6 +60942,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
         accepted[n_accept++] = drafts[i];
         replayed_drafts++;
         if (drafts[i] == eos_token) break;
+    }
     }
     if (stats_enabled) {
         s->dspark_stats.replay_ms += (now_sec() - replay_t0) * 1000.0;
