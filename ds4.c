@@ -47513,6 +47513,7 @@ struct ds4_session {
     uint32_t dspark_sched_cycles;
     uint32_t dspark_sched_accepted;
     uint32_t dspark_sched_no_draft;
+    uint32_t dspark_sched_consecutive_no_draft;
     uint32_t dspark_sched_skip;
     uint32_t dspark_sched_lifetime_accepted;
     double dspark_sched_life_extra_ms;
@@ -47601,6 +47602,20 @@ static uint32_t ds4_dspark_scheduler_no_draft_skip_cycles(void) {
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_SKIP", 3);
 }
 
+/*
+ * A single low-confidence first token (an isolated no-draft) should not pause
+ * speculation: on high-acceptance content (code) no-drafts are rare and
+ * interspersed with long accepts, and a per-no-draft pause throttles a large
+ * decode win down to near baseline. Only pause once no-drafts are *sustained*,
+ * which is the signal for genuinely unpredictable content (prose) where
+ * drafting does not pay. Measured on M5 Max: pausing per-no-draft left code
+ * decode at +2.7% vs a +20% ceiling; consecutive-gated it reaches +17%, while
+ * prose (sustained no-drafts) still backs off.
+ */
+static uint32_t ds4_dspark_scheduler_no_draft_consecutive_min(void) {
+    return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_NO_DRAFT_CONSECUTIVE_MIN", 2);
+}
+
 static uint32_t ds4_dspark_scheduler_short_accept_no_draft_skip_cycles(void) {
     return ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_SHORT_ACCEPT_NO_DRAFT_SKIP", 4);
 }
@@ -47665,7 +47680,12 @@ static void ds4_session_dspark_scheduler_note(
             s->dspark_sched_long_accept_seen = true;
         }
     }
-    if (no_draft) s->dspark_sched_no_draft++;
+    if (no_draft) {
+        s->dspark_sched_no_draft++;
+        s->dspark_sched_consecutive_no_draft++;
+    } else {
+        s->dspark_sched_consecutive_no_draft = 0;
+    }
     if (extra_ms > 0.0 && isfinite(extra_ms)) {
         s->dspark_sched_extra_ms += extra_ms;
     }
@@ -47682,7 +47702,9 @@ static void ds4_session_dspark_scheduler_note(
 
     const uint32_t no_draft_skip =
         ds4_dspark_scheduler_no_draft_skip_cycles();
-    if (no_draft && no_draft_skip != 0) {
+    if (no_draft && no_draft_skip != 0 &&
+        s->dspark_sched_consecutive_no_draft >=
+            ds4_dspark_scheduler_no_draft_consecutive_min()) {
         uint32_t skip = no_draft_skip;
         if (s->dspark_sched_lifetime_accepted != 0 &&
             !s->dspark_sched_long_accept_seen) {
