@@ -403,6 +403,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+/* Speculative decode with sampled (temperature > 0) support on the DSpark
+ * path. If *next_token is >= 0 on return, the cycle already drew the next
+ * position's target sample and the caller MUST emit it instead of sampling. */
+int ds4_session_eval_speculative(ds4_session *s, int first_token,
+                                 int max_tokens, int eos_token,
+                                 float temperature, float top_p, float min_p,
+                                 uint64_t *rng, int *next_token,
+                                 int *accepted, int accepted_cap,
+                                 char *err, size_t errlen);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
  * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */

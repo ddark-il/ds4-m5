@@ -60585,11 +60585,25 @@ int ds4_sessions_eval_batch_with_prefill(
 }
 
 #ifndef DS4_NO_GPU
+/* Greedy (temperature <= 0 or rng == NULL) and sampled DSpark verify cycle.
+ *
+ * Sampled mode is lossless deterministic-draft speculative sampling: every
+ * emitted token is an ordinary sample from its position's target
+ * distribution, drawn exactly once with the caller's rng. Position i's draw
+ * is compared with the greedy draft d_i — a match commits d_i (the sample
+ * IS the draft), a mismatch ends the cycle and the mismatching draw is
+ * handed back via *next_token_out as the already-drawn next token, which
+ * the caller must emit instead of sampling again. */
 static int ds4_session_eval_dspark_speculative_argmax(
         ds4_session *s,
         int          n_accept,
         int          max_tokens,
         int          eos_token,
+        float        temperature,
+        float        top_p,
+        float        min_p,
+        uint64_t    *rng,
+        int         *next_token_out,
         int         *accepted,
         int          accepted_cap,
         char        *err,
@@ -60683,7 +60697,12 @@ static int ds4_session_eval_dspark_speculative_argmax(
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
 
-    const int target_top = sample_argmax(s->logits, DS4_N_VOCAB);
+    const bool sampled = temperature > 0.0f && rng != NULL;
+    int correction = -1;
+    const int target_top = sampled ?
+        sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, 0,
+                           top_p, min_p, rng, s->sample_probs) :
+        sample_argmax(s->logits, DS4_N_VOCAB);
     if (target_top != drafts[0]) {
         if (stats_enabled) {
             s->dspark_stats.first_misses++;
@@ -60697,6 +60716,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
                     drafts[0],
                     target_top);
         }
+        /* The rejecting draw is the position's one target sample: the
+         * caller emits it directly instead of drawing again. */
+        if (sampled && next_token_out) *next_token_out = target_top;
         DS4_DSPARK_STATS_FINISH();
         return n_accept;
     }
@@ -60760,9 +60782,28 @@ static int ds4_session_eval_dspark_speculative_argmax(
     int commit_drafts = 0;
     if (ok) {
         commit_drafts = 1;
-        for (int i = 1; i < draft_n; i++) {
-            if (row_tops[i - 1] != drafts[i]) break;
-            commit_drafts++;
+        if (sampled) {
+            for (int i = 1; i < draft_n; i++) {
+                if (!metal_graph_read_spec_logits_row(&s->graph,
+                                                      (uint32_t)(i - 1),
+                                                      row_logits)) {
+                    ok = false;
+                    break;
+                }
+                const int t = sample_top_p_min_p(row_logits, DS4_N_VOCAB,
+                                                 temperature, 0, top_p, min_p,
+                                                 rng, s->sample_probs);
+                if (t != drafts[i]) {
+                    correction = t;
+                    break;
+                }
+                commit_drafts++;
+            }
+        } else {
+            for (int i = 1; i < draft_n; i++) {
+                if (row_tops[i - 1] != drafts[i]) break;
+                commit_drafts++;
+            }
         }
     }
 
@@ -60962,6 +61003,14 @@ static int ds4_session_eval_dspark_speculative_argmax(
     if (replayed_drafts > 0) {
         memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->checkpoint_valid = true;
+        /* Sampled partial accept: the rejecting draw at the cut position is
+         * that position's one target sample — hand it back for emission
+         * (skip if the replay was truncated by cap/eos and the cut position
+         * was not actually reached). */
+        if (sampled && correction >= 0 && replayed_drafts == commit_drafts &&
+            next_token_out) {
+            *next_token_out = correction;
+        }
         ds4_session_dspark_capture_note_checkpoint(s);
         if (stats_enabled) {
             if (replayed_drafts == draft_n) s->dspark_stats.full_accepts++;
@@ -63907,6 +63956,67 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
     return rc;
 }
 
+/* Speculative decode entry that also supports sampled (temperature > 0)
+ * generation via lossless deterministic-draft speculative sampling on the
+ * DSpark path. On return, *next_token >= 0 means the cycle already drew the
+ * next position's target sample (a rejecting accept-test draw): the caller
+ * must emit that token instead of sampling again, or the stream is biased.
+ * Falls back to the greedy entry at temperature <= 0 and to plain eval for
+ * configurations without sampled speculation (non-DSpark, TP, CPU, GLM,
+ * distributed, strict/quality). */
+int ds4_session_eval_speculative(ds4_session *s, int first_token,
+                                 int max_tokens, int eos_token,
+                                 float temperature, float top_p, float min_p,
+                                 uint64_t *rng, int *next_token,
+                                 int *accepted, int accepted_cap,
+                                 char *err, size_t errlen) {
+    if (next_token) *next_token = -1;
+    if (temperature <= 0.0f || !rng) {
+        return ds4_session_eval_speculative_argmax(s, first_token, max_tokens,
+                                                   eos_token, accepted,
+                                                   accepted_cap, err, errlen);
+    }
+    if (!s || !accepted || max_tokens <= 0 || accepted_cap <= 0) return 0;
+#ifndef DS4_NO_GPU
+    ds4_engine *e = s->engine;
+    const bool dspark_sampled_ok =
+        !s->distributed && !ds4_session_is_cpu(s) && !ds4_session_is_glm(s) &&
+        e->support_kind == DS4_SUPPORT_DSPARK && !e->tp.active &&
+        !e->quality && !e->dspark_strict;
+    if (!dspark_sampled_ok) {
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+    bool can_prepare_support_draft =
+        first_token != eos_token && max_tokens > 1 && accepted_cap > 1;
+    if (can_prepare_support_draft && ds4_dspark_scheduler_enabled()) {
+        const uint32_t tail_min = ds4_dspark_scheduler_tail_min_tokens();
+        if (tail_min != 0 && (uint32_t)max_tokens < tail_min) {
+            can_prepare_support_draft = false;
+            if (ds4_dspark_stats_enabled()) s->dspark_stats.tail_skips++;
+        }
+    }
+    if (ds4_session_eval_probe_tp(s, first_token, can_prepare_support_draft,
+                                  err, errlen) != 0) return -1;
+    int n_accept = 0;
+    accepted[n_accept++] = first_token;
+    if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap)
+        return n_accept;
+    if (!can_prepare_support_draft) return n_accept;
+    return ds4_session_eval_dspark_speculative_argmax(s, n_accept, max_tokens,
+                                                      eos_token, temperature,
+                                                      top_p, min_p, rng,
+                                                      next_token, accepted,
+                                                      accepted_cap, err,
+                                                      errlen);
+#else
+    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    accepted[0] = first_token;
+    return 1;
+#endif
+}
+
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
@@ -64022,6 +64132,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                           n_accept,
                                                           max_tokens,
                                                           eos_token,
+                                                          0.0f, 0.0f, 0.0f,
+                                                          NULL,
+                                                          NULL,
                                                           accepted,
                                                           accepted_cap,
                                                           err,

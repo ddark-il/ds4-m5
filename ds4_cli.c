@@ -583,12 +583,19 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
         cli_greedy_argmax_requested(speculative_argmax);
     bool have_greedy_next = false;
     int greedy_next = -1;
+    /* Sampled speculation hands back a pre-drawn target sample for the next
+     * position on rejection; emitting anything else would bias the stream. */
+    bool have_sampled_next = false;
+    int sampled_next = -1;
     const double t_decode0 = cli_now_sec();
     while (generated < max_tokens && !cli_interrupt_requested()) {
         int token;
         if (greedy_argmax && have_greedy_next) {
             token = greedy_next;
             have_greedy_next = false;
+        } else if (have_sampled_next) {
+            token = sampled_next;
+            have_sampled_next = false;
         } else {
             token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
@@ -597,18 +604,28 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        if (ds4_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            int next_tok = -1;
             cli_dist_busy_set(cfg, true);
-            ntok = ds4_session_eval_speculative_argmax(session,
-                                                       token,
-                                                       max_tokens - generated,
-                                                       ds4_token_eos(engine),
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
+            ntok = ds4_session_eval_speculative(session,
+                                                token,
+                                                max_tokens - generated,
+                                                ds4_token_eos(engine),
+                                                cfg->gen.temperature,
+                                                cfg->gen.top_p,
+                                                cfg->gen.min_p,
+                                                &rng,
+                                                &next_tok,
+                                                toks,
+                                                (int)(sizeof(toks) / sizeof(toks[0])),
+                                                err,
+                                                sizeof(err));
             cli_dist_busy_set(cfg, false);
+            if (next_tok >= 0) {
+                sampled_next = next_tok;
+                have_sampled_next = true;
+            }
             if (ntok < 0) {
                 fprintf(stderr, "ds4: decode failed: %s\n", err);
                 ds4_session_free(session);
