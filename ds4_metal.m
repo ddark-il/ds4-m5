@@ -2432,7 +2432,8 @@ static int ds4_gpu_warm_model_views(void) {
     }
     if (total_touches == 0 || total_touches > (uint64_t)NSUIntegerMax) return 0;
 
-    const NSUInteger out_bytes = (NSUInteger)total_touches;
+    /* Slack for the per-slice ceil rounding in the chunked touch loop. */
+    const NSUInteger out_bytes = (NSUInteger)total_touches + 4096u;
     id<MTLBuffer> out = [g_device newBufferWithLength:out_bytes
                                              options:MTLResourceStorageModeShared];
     if (!out) {
@@ -2441,36 +2442,58 @@ static int ds4_gpu_warm_model_views(void) {
     }
     out.label = @"ds4_model_warmup";
 
-    id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
-    if (!cb) {
-        fprintf(stderr, "ds4: Metal model warmup command buffer allocation failed\n");
-        return 0;
+    /*
+     * Touch the model in bounded slices, one command buffer each. A single
+     * command buffer that references the whole model forces the driver to
+     * make every byte resident at once, which fails with Insufficient
+     * Memory once the model outgrows the per-command-buffer residency
+     * ceiling (~100 GiB on M5 Max: the 92.6 GiB mix warms fine, a 101 GiB
+     * mix does not, yet prefill streams the same model without complaint
+     * because its command buffers wire incrementally).
+     */
+    uint64_t cb_span = 16ull * 1024ull * 1024ull * 1024ull;
+    const char *cb_gib_env = getenv("DS4_METAL_MODEL_WARMUP_CB_GIB");
+    if (cb_gib_env && cb_gib_env[0]) {
+        char *end = NULL;
+        unsigned long long gib = strtoull(cb_gib_env, &end, 10);
+        if (end != cb_gib_env && gib > 0 && gib <= 1024) {
+            cb_span = gib * 1024ull * 1024ull * 1024ull;
+        }
     }
 
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:pipeline];
     uint64_t dst_offset = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
-        const uint64_t bytes = g_model_views[i].bytes;
-        const uint64_t n = (bytes + stride - 1) / stride;
-        [enc setBuffer:g_model_views[i].buffer offset:0 atIndex:0];
-        [enc setBuffer:out offset:0 atIndex:1];
-        [enc setBytes:&stride length:sizeof(stride) atIndex:2];
-        [enc setBytes:&bytes length:sizeof(bytes) atIndex:3];
-        [enc setBytes:&dst_offset length:sizeof(dst_offset) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        dst_offset += n;
-    }
-    ds4_gpu_end_compute_encoder(cb, enc);
+        const uint64_t view_bytes = g_model_views[i].bytes;
+        for (uint64_t off = 0; off < view_bytes; off += cb_span) {
+            const uint64_t bytes = (view_bytes - off < cb_span) ?
+                (view_bytes - off) : cb_span;
+            const uint64_t n = (bytes + stride - 1) / stride;
 
-    [cb commit];
-    [cb waitUntilCompleted];
+            id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+            if (!cb) {
+                fprintf(stderr, "ds4: Metal model warmup command buffer allocation failed\n");
+                return 0;
+            }
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:g_model_views[i].buffer offset:(NSUInteger)off atIndex:0];
+            [enc setBuffer:out offset:0 atIndex:1];
+            [enc setBytes:&stride length:sizeof(stride) atIndex:2];
+            [enc setBytes:&bytes length:sizeof(bytes) atIndex:3];
+            [enc setBytes:&dst_offset length:sizeof(dst_offset) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
 
-    if (cb.status == MTLCommandBufferStatusError) {
-        fprintf(stderr, "ds4: Metal model warmup failed: %s\n",
-                [[cb.error localizedDescription] UTF8String]);
-        return 0;
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (cb.status == MTLCommandBufferStatusError) {
+                fprintf(stderr, "ds4: Metal model warmup failed: %s\n",
+                        [[cb.error localizedDescription] UTF8String]);
+                return 0;
+            }
+            dst_offset += n;
+        }
     }
 
     return 1;
