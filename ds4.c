@@ -4314,6 +4314,28 @@ static void tensor_expect_dense_quant_layout(
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
+/*
+ * Decode routes attention projections through ds4_gpu_matmul_quant_tensor and
+ * the type-aware output-low / hc-expand paths. Only q8_0 and q4_K are wired and
+ * verified end-to-end for attention; other dense-quant types (e.g. q4_0) reach
+ * decode kernels that assume a different block layout and would emit NaN logits
+ * with no error (prefill's tiled mul_mm is more permissive, which is why such a
+ * GGUF can load and produce a finite first token, then silently diverge). Fail
+ * loudly at load instead. Extend this set as new attention decode types land.
+ */
+static void tensor_expect_attn_proj_decode_supported(const ds4_tensor *t) {
+    if (!t) return;
+    if (t->type != DS4_TENSOR_Q8_0 && t->type != DS4_TENSOR_Q4_K) {
+        fprintf(stderr,
+                "ds4: attention projection %.*s has type %s; decode supports "
+                "only q8_0 or q4_K for attention projections\n",
+                (int)t->name.len,
+                t->name.ptr,
+                tensor_type_name(t->type));
+        exit(1);
+    }
+}
+
 static void tensor_expect_optional(
         const ds4_tensor *t,
         uint32_t          type,
@@ -4974,6 +4996,11 @@ static void weights_validate_layout(
         tensor_expect_layout(l->attn_sinks,     DS4_TENSOR_F32,  1, DS4_N_HEAD, 0, 0);
         tensor_expect_dense_quant_layout(l->attn_output_a,  2, DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP), out_low_dim, 0);
         tensor_expect_dense_quant_layout(l->attn_output_b,  2, out_low_dim, DS4_N_EMBD, 0);
+        tensor_expect_attn_proj_decode_supported(l->attn_q_a);
+        tensor_expect_attn_proj_decode_supported(l->attn_q_b);
+        tensor_expect_attn_proj_decode_supported(l->attn_kv);
+        tensor_expect_attn_proj_decode_supported(l->attn_output_a);
+        tensor_expect_attn_proj_decode_supported(l->attn_output_b);
 
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
