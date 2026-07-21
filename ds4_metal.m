@@ -37364,10 +37364,15 @@ int ds4_gpu_routed_moe_batch_tensor(
             !use_q4_batch_expert_table &&
             !use_iq2_batch_selected_addr;
         /*
-         * Fused gate+up grouped matmul with the SwiGLU epilogue.  The IQ2
-         * variant stays opt-in behind its env flag; the Q4_K variant is the
-         * default path — same MMA accumulation order and epilogue math as the
-         * separate GEMMs + swiglu pass, so the mid tensor is bit-identical.
+         * Fused gate+up grouped matmul with the SwiGLU epilogue.  The Q4_K
+         * variant is the default path everywhere.  The IQ2_XXS + Q2_K variant
+         * is the default on M5 (measured ~+1.1% prefill at ctx 8192, 95% CI
+         * [+0.7%, +1.6%], 7/7 drift-cancelled ABBA blocks positive) and stays
+         * opt-in behind DS4_METAL_ENABLE_MOE_MM_ID_PAIR_SWIGLU on other devices
+         * whose kernels were not measured.  Either variant keeps the same MMA
+         * accumulation order and epilogue math as the separate GEMMs + swiglu
+         * pass, so the mid tensor is bit-identical.
+         * DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU forces it off.
          */
         const bool use_mm_id_pair_swiglu =
             use_mm_id &&
@@ -37376,7 +37381,8 @@ int ds4_gpu_routed_moe_batch_tensor(
             n_expert == 6 &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               down_type == DS4_METAL_TENSOR_Q2_K &&
-              getenv("DS4_METAL_ENABLE_MOE_MM_ID_PAIR_SWIGLU") != NULL) ||
+              (ds4_gpu_device_name_contains("M5") ||
+               getenv("DS4_METAL_ENABLE_MOE_MM_ID_PAIR_SWIGLU") != NULL)) ||
              (gate_type == DS4_METAL_TENSOR_Q4_K &&
               down_type == DS4_METAL_TENSOR_Q4_K)) &&
             getenv("DS4_METAL_DISABLE_MOE_MM_ID_PAIR_SWIGLU") == NULL &&
