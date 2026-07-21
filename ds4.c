@@ -21471,6 +21471,34 @@ typedef enum {
     METAL_DECODE_LAYER_FROM_ROUTER,
 } metal_decode_layer_phase;
 
+/* Hot-expert overlay descriptor for a layer, or NULL when the layer has no
+ * overlay tensors. `out` is caller storage (a compound literal at call sites). */
+static const ds4_gpu_hot_experts *ds4_layer_hot_experts(
+        const ds4_model *m,
+        const ds4_layer_weights *l,
+        ds4_gpu_hot_experts *out) {
+    if (!l->ffn_hot_ids || !l->ffn_gate_exps_hot ||
+        !l->ffn_up_exps_hot || !l->ffn_down_exps_hot) {
+        return NULL;
+    }
+    const uint64_t n_hot = l->ffn_hot_ids->dim[0];
+    out->n_hot = (uint32_t)n_hot;
+    out->hot_ids = (const int32_t *)((const char *)m->map +
+                                     l->ffn_hot_ids->abs_offset);
+    out->gate_offset = l->ffn_gate_exps_hot->abs_offset;
+    out->up_offset = l->ffn_up_exps_hot->abs_offset;
+    out->down_offset = l->ffn_down_exps_hot->abs_offset;
+    out->gate_type = l->ffn_gate_exps_hot->type;
+    out->down_type = l->ffn_down_exps_hot->type;
+    out->gate_expert_bytes = l->ffn_gate_exps_hot->bytes / n_hot;
+    out->gate_row_bytes = l->ffn_gate_exps_hot->bytes /
+                          (n_hot * l->ffn_gate_exps_hot->dim[1]);
+    out->down_expert_bytes = l->ffn_down_exps_hot->bytes / n_hot;
+    out->down_row_bytes = l->ffn_down_exps_hot->bytes /
+                          (n_hot * l->ffn_down_exps_hot->dim[1]);
+    return out;
+}
+
 static bool metal_graph_encode_decode_layer_phase(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -23097,7 +23125,8 @@ static bool metal_graph_encode_decode_layer_phase(
                         DS4_N_EXPERT,
                         tp_experts,
                         DS4_SWIGLU_CLAMP_EXP,
-                        peer_ffn_norm, NULL, 0, false) != 0;
+                        peer_ffn_norm, NULL, 0, false,
+                                             NULL) != 0;
             }
         }
 #if !defined(__APPLE__)
@@ -23178,7 +23207,8 @@ static bool metal_graph_encode_decode_layer_phase(
                         DS4_N_EXPERT,
                         tp_experts,
                         DS4_SWIGLU_CLAMP_EXP,
-                        metal_graph_ffn_norm(g), NULL, 0, false) != 0;
+                        metal_graph_ffn_norm(g), NULL, 0, false,
+                                             ds4_layer_hot_experts(model, layer, &(ds4_gpu_hot_experts){0})) != 0;
             }
         }
 #if !defined(__APPLE__)
@@ -23358,7 +23388,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                      NULL,
                                                      il,
-                                                     false) != 0;
+                                                     false,
+                                             ds4_layer_hot_experts(model, layer, &(ds4_gpu_hot_experts){0})) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
@@ -23564,7 +23595,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                      NULL,
                                                      il,
-                                                     false) != 0;
+                                                     false,
+                                             ds4_layer_hot_experts(model, layer, &(ds4_gpu_hot_experts){0})) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
@@ -23656,7 +23688,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                                                  NULL,
                                                  il,
-                                                 false) != 0;
+                                                 false,
+                                             ds4_layer_hot_experts(model, layer, &(ds4_gpu_hot_experts){0})) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_routed_gate(g),
@@ -23912,7 +23945,8 @@ static bool metal_graph_encode_decode_layer_phase(
                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, metal_graph_ffn_norm(g),
                 metal_graph_shared_out(g),
                 il,
-                false) != 0;
+                false,
+                                             ds4_layer_hot_experts(model, layer, &(ds4_gpu_hot_experts){0})) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe_folded");
     }
     ds4_gpu_tensor *tp_ffn_a = NULL;    /* rank0/rank1 partials consumed */
@@ -28927,7 +28961,8 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                x_row,
                                                NULL,
                                                il,
-                                               false) != 0;
+                                               false,
+                                             ds4_layer_hot_experts(model, layer, &(ds4_gpu_hot_experts){0})) != 0;
             ds4_gpu_tensor_free(w_row);
             ds4_gpu_tensor_free(sel_row);
             ds4_gpu_tensor_free(x_row);
@@ -39689,7 +39724,8 @@ static int glm_graph_routed_moe_one_dispatch(
                                              x,
                                              NULL,
                                              il,
-                                             force_resident);
+                                             force_resident,
+                                             NULL);
     }
 
     return ds4_gpu_glm_routed_moe_one_tensor(out,

@@ -8165,3 +8165,50 @@ kernel void kernel_moe_hot_split_map(
         hot_ids_rows[gid] = ids[(uint)hot_ids[h] * args.ne21 + j];
     }
 }
+
+// Hot-expert split for the decode/tiny selected-slot paths. Per token, hot
+// slots keep their route weight in the hot view (with the id remapped to the
+// hot-slab row) and are zero-weighted in the cold view; the replacement ids
+// are duplicates of rows the same dispatch already reads, so skipped slots
+// cost cache hits, and their zero mid rows null the down contribution
+// without any kernel changes.
+struct ds4_metal_args_moe_hot_sel {
+    uint32_t n_tokens;
+    uint32_t n_expert;   /* slots per token */
+    uint32_t n_hot;
+};
+
+kernel void kernel_moe_hot_split_selected(
+        constant ds4_metal_args_moe_hot_sel & args,
+        device const int32_t * selected,
+        device const float   * weights,
+        constant int32_t     * hot_ids,
+        device int32_t       * sel_cold,
+        device float         * w_cold,
+        device int32_t       * sel_hot,
+        device float         * w_hot,
+        uint tok [[thread_position_in_grid]]) {
+    if (tok >= args.n_tokens) return;
+    const uint base = tok * args.n_expert;
+    int cold_dup = -1, hot_dup = -1;
+    int slab[16];
+    for (uint s = 0; s < args.n_expert && s < 16u; s++) {
+        const int id = selected[base + s];
+        int h = -1;
+        for (uint k = 0; k < args.n_hot; k++) {
+            if (hot_ids[k] == id) { h = (int)k; break; }
+        }
+        slab[s] = h;
+        if (h < 0 && cold_dup < 0) cold_dup = id;
+        if (h >= 0 && hot_dup < 0) hot_dup = h;
+    }
+    if (cold_dup < 0) cold_dup = selected[base]; /* all-hot token: weight-0 row */
+    if (hot_dup < 0) hot_dup = 0;
+    for (uint s = 0; s < args.n_expert && s < 16u; s++) {
+        const bool hot = slab[s] >= 0;
+        sel_cold[base + s] = hot ? cold_dup : selected[base + s];
+        w_cold[base + s]   = hot ? 0.0f : weights[base + s];
+        sel_hot[base + s]  = hot ? slab[s] : hot_dup;
+        w_hot[base + s]    = hot ? weights[base + s] : 0.0f;
+    }
+}
