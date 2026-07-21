@@ -21560,7 +21560,11 @@ static bool metal_graph_encode_decode_layer_phase(
     if (!resume_after_qkv) {
     bool qkv_pair_projected = resume_after_qa_kv_raw;
     if (!resume_after_qa_kv_raw && ok && qkv_rms_fused &&
-        g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj()) {
+        g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj() &&
+        layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_kv->type == DS4_TENSOR_Q8_0) {
+        /* The fused QKV-pair projection kernel is Q8_0-only; Q4_K attention
+         * weights fall back to the separate type-aware projections below. */
         qkv_pair_projected = ds4_gpu_matmul_q8_0_pair_tensor(
                 metal_graph_qr(g),
                 metal_graph_kv_raw(g),
@@ -21574,8 +21578,8 @@ static bool metal_graph_encode_decode_layer_phase(
                 metal_graph_attn_norm(g),
                 1) != 0;
     }
-    if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(metal_graph_qr(g), model->map, model->size,
-                                                                     layer->attn_q_a->abs_offset,
+    if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) ok = ds4_gpu_matmul_quant_tensor(metal_graph_qr(g), model->map, model->size,
+                                                                     layer->attn_q_a->abs_offset, layer->attn_q_a->type,
                                                                      DS4_N_EMBD, q_rank,
                                                                      metal_graph_attn_norm(g), 1) != 0;
     if (ok) {
@@ -21584,8 +21588,8 @@ static bool metal_graph_encode_decode_layer_phase(
     const bool kvnorm_dump = metal_graph_debug_wants("KVnorm", il, pos);
     bool kv_rope_fused = false;
     if (qkv_rms_fused) {
-        if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) ok = ds4_gpu_matmul_q8_0_tensor(metal_graph_kv_raw(g), model->map, model->size,
-                                                                         layer->attn_kv->abs_offset,
+        if (!resume_after_qa_kv_raw && ok && !qkv_pair_projected) ok = ds4_gpu_matmul_quant_tensor(metal_graph_kv_raw(g), model->map, model->size,
+                                                                         layer->attn_kv->abs_offset, layer->attn_kv->type,
                                                                          DS4_N_EMBD, DS4_N_HEAD_DIM,
                                                                          metal_graph_attn_norm(g), 1) != 0;
         if (ok) {
