@@ -2361,28 +2361,28 @@ static void ds4_gpu_detect_metal4_features(void) {
         g_metal4_queue_supported = [g_device respondsToSelector:@selector(newMTL4CommandQueue)] ? 1 : 0;
 
         /*
-         * Apple does not currently expose a separate "Neural Accelerator" bit
-         * through Metal. On public M5 systems the hardware signal is the device
-         * generation plus Metal 4 support, so keep this as a conservative hint.
+         * MTLGPUFamilyApple10 is Apple's documented proxy for "each GPU core
+         * has a neural accelerator" (M5/A19 and later). Prefer it over a device
+         * name list: it is the official capability bit and auto-covers future
+         * generations (M6, A20, ...) with no name table to maintain.
          */
-        if (g_metal4_family_supported && ds4_gpu_device_name_contains("M5")) {
+        if (g_metal4_family_supported &&
+            [g_device supportsFamily:MTLGPUFamilyApple10]) {
             g_metal4_m5_neural_accelerators_hint = 1;
         }
 
         if (g_metal4_family_supported) {
             const int default_enable =
-                ds4_gpu_device_name_contains("M5") ||
-                ds4_gpu_device_name_contains("M6") ||
-                ds4_gpu_device_name_contains("A19") ||
-                ds4_gpu_device_name_contains("A20");
+                [g_device supportsFamily:MTLGPUFamilyApple10] ? 1 : 0;
 
             /*
-             * Metal 4 TensorOps are portable in source, but on pre-M5 hardware
-             * they can map to ordinary shader fallbacks.  Keep the automatic
-             * fast path restricted to hardware generations where the Neural
-             * Accelerator/TensorOps path is expected to pay off; older Metal
-             * machines continue to use the established kernels unless a future
-             * device is explicitly added here.
+             * Metal 4 TensorOps are portable in source, but on pre-Apple10
+             * hardware they can map to ordinary shader fallbacks.  Restrict the
+             * automatic fast path to Apple10+ (neural-accelerator) devices where
+             * the TensorOps path is expected to pay off; older Metal machines
+             * continue to use the established kernels.  A runtime compile probe
+             * below still gates enablement, so an Apple10 device whose TensorOps
+             * fail to compile falls back cleanly.
              */
             if (default_enable) {
                 g_metal4_tensor_api_compile_supported = ds4_gpu_compile_tensor_probe();
