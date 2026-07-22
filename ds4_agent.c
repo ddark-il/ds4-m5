@@ -103,6 +103,7 @@ typedef struct {
     int ctx_used;
     int ctx_size;
     int power_percent;
+    ds4_think_mode think_mode;
     char error[256];
 } agent_status;
 
@@ -155,6 +156,7 @@ typedef struct {
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
     bool datetime_context_injected;
+    bool cwd_context_injected;
     int last_system_prompt_reminder_at;
     char more_path[PATH_MAX];
     int more_next_line;
@@ -517,6 +519,9 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
+           !strcmp(cmd, "/think") ||
+           !strcmp(cmd, "/think-max") ||
+           !strcmp(cmd, "/nothink") ||
            agent_slash_command_with_args(cmd, "/power") ||
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
@@ -578,6 +583,128 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
         exit(2);
     }
     return argv[++(*i)];
+}
+
+/* ---- default.cfg: launch flags in a file --------------------------------
+ * A config file holds ds4-agent flags in argv form (whitespace/newline
+ * separated; '#' begins a comment; single or double quotes group a value that
+ * contains spaces).  Its tokens are spliced *ahead* of the real command line,
+ * and parse_options is last-assignment-wins, so anything on the command line
+ * overrides the file.  Files layer: <exedir>/default.cfg first, then
+ * $HOME/.ds4/default.cfg, so a per-user file overrides the install default. */
+typedef struct { char **v; int len; int cap; } cfg_argv;
+
+static void cfg_argv_push(cfg_argv *a, char *tok) {
+    if (a->len == a->cap) {
+        a->cap = a->cap ? a->cap * 2 : 16;
+        a->v = xrealloc(a->v, (size_t)a->cap * sizeof(*a->v));
+    }
+    a->v[a->len++] = tok;
+}
+
+static void cfg_tokenize(const char *text, cfg_argv *a) {
+    const char *p = text;
+    char buf[4096];
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (!*p) break;
+        if (*p == '#') { while (*p && *p != '\n') p++; continue; }
+        size_t n = 0;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') {
+            if (*p == '"' || *p == '\'') {          /* grouped value */
+                char q = *p++;
+                while (*p && *p != q) {
+                    if (n + 1 < sizeof(buf)) buf[n++] = *p;
+                    p++;
+                }
+                if (*p == q) p++;
+            } else {
+                if (n + 1 < sizeof(buf)) buf[n++] = *p;
+                p++;
+            }
+        }
+        buf[n] = '\0';
+        cfg_argv_push(a, xstrdup(buf));
+    }
+}
+
+static void cfg_load_file(const char *path, cfg_argv *toks, bool required) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        if (required)
+            fprintf(stderr, "ds4-agent: cannot open config %s: %s\n",
+                    path, strerror(errno));
+        return;
+    }
+    if (fseek(fp, 0, SEEK_END) == 0) {
+        long sz = ftell(fp);
+        if (sz > 0) {
+            rewind(fp);
+            char *text = xmalloc((size_t)sz + 1);
+            size_t rd = fread(text, 1, (size_t)sz, fp);
+            text[rd] = '\0';
+            cfg_tokenize(text, toks);
+            free(text);
+        }
+    }
+    fclose(fp);
+}
+
+/* Build the effective argv: [argv0] [config tokens] [original args].  Returns
+ * the original argv untouched when no config applies.  --no-config disables
+ * the search; --config FILE replaces it with an explicit file. */
+static char **agent_apply_config_files(int argc, char **argv, int *out_argc) {
+    const char *explicit_cfg = NULL;
+    bool no_config = false;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--no-config")) no_config = true;
+        else if (!strcmp(argv[i], "--config") && i + 1 < argc)
+            explicit_cfg = argv[i + 1];
+    }
+    if (no_config) { *out_argc = argc; return argv; }
+
+    cfg_argv toks = {0};
+    char path[4096];
+    if (explicit_cfg) {
+        cfg_load_file(explicit_cfg, &toks, true);
+    } else {
+        char exe_dir[4096];
+        if (ds4_executable_dir(exe_dir, sizeof(exe_dir)) == 0) {
+            snprintf(path, sizeof(path), "%s/default.cfg", exe_dir);
+            cfg_load_file(path, &toks, false);
+        }
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            snprintf(path, sizeof(path), "%s/.ds4/default.cfg", home);
+            cfg_load_file(path, &toks, false);
+        }
+    }
+    if (toks.len == 0) { free(toks.v); *out_argc = argc; return argv; }
+
+    int merged_argc = 1 + toks.len + (argc - 1);
+    char **merged = xmalloc((size_t)(merged_argc + 1) * sizeof(*merged));
+    int k = 0;
+    merged[k++] = argv[0];
+    for (int i = 0; i < toks.len; i++) merged[k++] = toks.v[i];
+    for (int i = 1; i < argc; i++) merged[k++] = argv[i];
+    merged[k] = NULL;
+    free(toks.v);            /* token strings are now owned by merged */
+    *out_argc = merged_argc;
+    return merged;
+}
+
+/* Resolve a relative asset path against the executable directory when it is
+ * not present in the current directory, so the default model / support GGUF
+ * load off the install tree regardless of the launch directory. */
+static const char *agent_resolve_asset_path(const char *path) {
+    if (!path || !path[0] || path[0] == '/') return path;
+    if (access(path, F_OK) == 0) return path;
+    char exe_dir[4096];
+    if (ds4_executable_dir(exe_dir, sizeof(exe_dir)) != 0) return path;
+    char candidate[4096];
+    snprintf(candidate, sizeof(candidate), "%s/%s", exe_dir, path);
+    if (access(candidate, F_OK) != 0) return path;  /* keep original for a clean error */
+    return xstrdup(candidate);
 }
 
 static agent_config parse_options(int argc, char **argv) {
@@ -701,6 +828,10 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--config")) {
+            (void)need_arg(&i, argc, argv, arg);  /* applied in agent_apply_config_files */
+        } else if (!strcmp(arg, "--no-config")) {
+            /* applied in agent_apply_config_files */
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -1191,6 +1322,21 @@ static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
     ds4_chat_append_message(w->engine, &w->transcript, "system", msg);
     agent_trace_text(w, "datetime-context", msg, strlen(msg));
     w->datetime_context_injected = true;
+}
+
+static void agent_worker_maybe_append_cwd_context(agent_worker *w) {
+    if (w->cwd_context_injected) return;
+
+    char cwd[4096];
+    if (getcwd(cwd, sizeof(cwd))) {
+        char msg[4224];
+        snprintf(msg, sizeof(msg),
+                 "Working directory for tool calls (bash, file reads and writes): "
+                 "%s. Relative paths passed to tools resolve from here.", cwd);
+        ds4_chat_append_message(w->engine, &w->transcript, "system", msg);
+        agent_trace_text(w, "cwd-context", msg, strlen(msg));
+    }
+    w->cwd_context_injected = true;
 }
 
 static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
@@ -4718,6 +4864,7 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
     w->datetime_context_injected = false;
+    w->cwd_context_injected = false;
     agent_worker_clear_session_identity(w);
     free(text);
     ds4_tokens_free(&sys);
@@ -5855,6 +6002,7 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
         free(w->legacy_session_path_to_delete);
         w->legacy_session_path_to_delete = meta.legacy_identity ? xstrdup(path) : NULL;
         w->datetime_context_injected = true;
+        w->cwd_context_injected = true;
         pthread_mutex_lock(&w->mu);
         w->user_activity = true;
         w->session_dirty = false;
@@ -8486,6 +8634,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         return 1;
     }
     agent_worker_maybe_append_datetime_context(w);
+    agent_worker_maybe_append_cwd_context(w);
     agent_trace_text(w, "user", user_text ? user_text : "",
                      user_text ? strlen(user_text) : 0);
     if (!w->session_title) {
@@ -9429,10 +9578,14 @@ static const char *agent_prefill_label(const agent_status *st) {
  * because linenoise redraws it on every progress update. */
 static void build_status_text(const agent_status *st, char *buf, size_t len) {
     char used[32], total_ctx[32];
-    char power[32];
+    char power[64];
     agent_format_ctx_size(st->ctx_used, used, sizeof(used));
     agent_format_ctx_size(st->ctx_size, total_ctx, sizeof(total_ctx));
     agent_power_status_suffix(st, power, sizeof(power));
+    /* Always show the current thinking mode after any power suffix. */
+    size_t power_len = strlen(power);
+    snprintf(power + power_len, sizeof(power) - power_len, " | think:%s",
+             ds4_think_mode_name(st->think_mode));
 
     switch (st->state) {
     case AGENT_WORKER_PREFILL: {
@@ -10417,6 +10570,9 @@ static void runtime_help(void) {
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
+    puts("  /think       Thinking mode: high (applies to the next turn).");
+    puts("  /think-max   Thinking mode: max (needs ctx >= 393216, else high).");
+    puts("  /nothink     Thinking mode: none (applies to the next turn).");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -10851,6 +11007,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
     agent_status st;
     worker_get_status(&worker, &st);
+    st.think_mode = cfg->gen.think_mode;
     char prompt[160];
     char statusline[4096];
     build_prompt_text(&st, prompt, sizeof(prompt));
@@ -10916,6 +11073,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         char *out = NULL;
         size_t out_len = 0;
         worker_consume(&worker, &out, &out_len, &st);
+        st.think_mode = cfg->gen.think_mode;
         build_prompt_text(&st, prompt, sizeof(prompt));
         int footer_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
         build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
@@ -11092,6 +11250,19 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             worker_request_power(&worker, power);
                         }
                     }
+                } else if (!strcmp(cmd, "/think")) {
+                    cfg->gen.think_mode = DS4_THINK_HIGH;
+                    printf("Thinking mode: high.\n");
+                } else if (!strcmp(cmd, "/think-max")) {
+                    cfg->gen.think_mode = DS4_THINK_MAX;
+                    bool think_max_active =
+                        ds4_think_mode_for_context(cfg->gen.think_mode,
+                                                   cfg->gen.ctx_size) == DS4_THINK_MAX;
+                    printf("Thinking mode: %s.\n",
+                           think_max_active ? "max" : "high (context below 393216)");
+                } else if (!strcmp(cmd, "/nothink")) {
+                    cfg->gen.think_mode = DS4_THINK_NONE;
+                    printf("Thinking mode: none.\n");
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
                     ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
                     (void)ignored;
@@ -11255,12 +11426,18 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
-    agent_config cfg = parse_options(argc, argv);
+    int eff_argc = argc;
+    char **eff_argv = agent_apply_config_files(argc, argv, &eff_argc);
+    agent_config cfg = parse_options(eff_argc, eff_argv);
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));
         return 1;
     }
+    /* Resolve default/relative asset paths against the executable directory so
+     * ds4-agent can be launched from any working directory without --chdir. */
+    cfg.engine.model_path = agent_resolve_asset_path(cfg.engine.model_path);
+    cfg.engine.mtp_path = agent_resolve_asset_path(cfg.engine.mtp_path);
     cfg.engine.context_size = cfg.gen.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.gen.ctx_size;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {

@@ -308,6 +308,8 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--autosave-interval N", "Seconds between session autosaves. 0 disables. Default: 300");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
+    opt(fp, c, "--config FILE", "Read launch flags from FILE (argv form) instead of the default search.");
+    opt(fp, c, "--no-config", "Ignore default.cfg in the executable dir and ~/.ds4.");
     fputc('\n', fp);
 }
 
@@ -321,6 +323,7 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/strip ID", "Remove KV payload; the text history can be rebuilt later.");
     opt(fp, c, "/history [N]", "Show N recent user turns from the current session.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
+    opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode for the next turn.");
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
     opt(fp, c, "/quit, /exit", "Exit.");
     fputc('\n', fp);

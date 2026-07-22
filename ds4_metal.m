@@ -936,8 +936,10 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
         }
     }
     if (cb.status == MTLCommandBufferStatusError) {
-        fprintf(stderr, "ds4: Metal %s failed: %s\n",
-                label, [[cb.error localizedDescription] UTF8String]);
+        const char *desc = cb.error ? [[cb.error localizedDescription] UTF8String] : NULL;
+        if (!desc) desc = "unknown Metal command buffer error";
+        fprintf(stderr, "ds4: Metal %s failed: %s\n", label, desc);
+        ds4_gpu_set_last_error(desc);
         return 0;
     }
     return 1;
@@ -1916,8 +1918,15 @@ static id<MTLBuffer> ds4_gpu_new_transient_buffer(NSUInteger bytes, const char *
     id<MTLBuffer> buffer = [g_device newBufferWithLength:bytes
                                                  options:MTLResourceStorageModeShared];
     if (!buffer) {
-        fprintf(stderr, "ds4: failed to allocate Metal transient buffer %s (%llu bytes)\n",
-                label ? label : "(unnamed)", (unsigned long long)bytes);
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "failed to allocate Metal transient buffer %s (%llu bytes)",
+                 label ? label : "(unnamed)", (unsigned long long)bytes);
+        fprintf(stderr, "ds4: %s\n", msg);
+        /* Surface the reason: an allocation failure never reaches a command
+         * buffer, so the session layer would otherwise report only a generic
+         * "prefill failed" with no clue that the GPU ran out of headroom. */
+        ds4_gpu_set_last_error(msg);
         return nil;
     }
     if (label) buffer.label = [NSString stringWithUTF8String:label];
@@ -3736,6 +3745,15 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
     ];
 
+    /* Resolve shader sources relative to the executable as a last resort so
+     * ds4 can be launched from any working directory (e.g. off $PATH) without
+     * --chdir.  The current directory is still tried first to preserve the
+     * edit-in-tree workflow and any DS4_METAL_*_SOURCE override. */
+    char exe_dir_buf[4096];
+    NSString *exe_dir = (ds4_executable_dir(exe_dir_buf, sizeof(exe_dir_buf)) == 0)
+        ? [NSString stringWithUTF8String:exe_dir_buf]
+        : nil;
+
     NSMutableString *source = [NSMutableString stringWithString:base];
     for (NSArray<NSString *> *spec in required_sources) {
         const char *override_path = getenv([spec[0] UTF8String]);
@@ -3745,6 +3763,9 @@ static NSString *ds4_gpu_full_source(void) {
         }
         [paths addObject:spec[1]];
         [paths addObject:[@"./" stringByAppendingString:spec[1]]];
+        if (exe_dir) {
+            [paths addObject:[exe_dir stringByAppendingPathComponent:spec[1]]];
+        }
 
         NSString *loaded = nil;
         NSString *loaded_path = nil;

@@ -248,6 +248,11 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
+
+/* Absolute directory of the running executable (symlinks resolved, no trailing
+ * slash).  Returns 0 on success, -1 on failure.  Used to resolve runtime assets
+ * relative to the binary rather than the current working directory. */
+int ds4_executable_dir(char *buf, size_t len);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);

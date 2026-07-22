@@ -1,0 +1,33 @@
+# ds4-agent launch defaults, in argv form.
+#
+# Activate by copying this file to either location (ds4-agent reads both, the
+# per-user file winning; the command line still overrides everything):
+#
+#   <install dir>/default.cfg     shipped next to the ds4-agent binary
+#   ~/.ds4/default.cfg            per-user overrides
+#
+# Syntax: one or more flags per line. '#' begins a comment. Quote values that
+# contain spaces (e.g. -sys "You are a ..."). Relative model/--mtp paths and the
+# metal shader sources resolve against the executable directory, so ds4-agent
+# works from any directory (including off $PATH) with no --chdir.
+#
+# Disable this file for one run with --no-config; point at another file with
+# --config FILE.
+
+# --- Speculative decoding (DSpark) ---
+# Helps most on greedy / code-style workloads; see the model notes before
+# leaving it on for long thinking-mode sessions.
+--dspark
+--mtp gguf/DeepSeek-V4-Flash-DSpark-support.gguf
+
+# --- Sampling ---
+--temp 0.6
+--top-p 0.95
+
+# --- Context and generation budget ---
+--ctx 196608
+--tokens 12288
+
+# --- Runtime ---
+--threads 12
+--prefill-chunk 4096

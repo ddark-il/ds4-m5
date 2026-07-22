@@ -798,8 +798,27 @@ future saves and is derived from the first user prompt and creation time.
 conversation text and title but removes the heavy KV payload; switching to a
 stripped session rebuilds the KV cache by prefilling the saved text.
 
-Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
-so relative runtime files such as `metal/*.metal` resolve from the project tree.
+`ds4-agent` can be launched from any directory, including through a symlink on
+your `$PATH`. Runtime assets (the metal shader sources and the default
+`ds4flash.gguf`, plus relative `--mtp`/`-m` paths) resolve against the real
+executable directory, and the agent's tools run in your current working
+directory — no `--chdir` is needed. (`--chdir DIR` is still accepted for
+launchers that want an explicit working directory.)
+
+Launch flags can live in a config file so plain `ds4-agent` starts your usual
+setup. Flags are read, in argv form, from `<executable dir>/default.cfg` and
+then `~/.ds4/default.cfg` (the per-user file wins); anything on the command line
+overrides both. `#` begins a comment and quotes group a value with spaces. Copy
+`default.cfg.example` to get started; use `--no-config` to skip the files or
+`--config FILE` to point elsewhere. For example:
+
+```
+# ~/.ds4/default.cfg
+--dspark
+--mtp gguf/DeepSeek-V4-Flash-DSpark-support.gguf
+--ctx 196608
+--temp 0.6
+```
 
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach

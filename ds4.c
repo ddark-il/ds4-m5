@@ -28,6 +28,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #include <string.h>
 #include <strings.h>
 #include <sys/file.h>
@@ -57939,6 +57942,61 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     return rc;
 }
 
+/* Absolute directory of the running executable (no trailing slash), with
+ * symlinks resolved so a $PATH symlink still points back to the real install
+ * tree.  Lets runtime assets (the metal shader sources, the default GGUF) and
+ * default.cfg resolve relative to the binary instead of the current directory.
+ * Returns 0 on success, -1 if the path cannot be determined. */
+int ds4_executable_dir(char *buf, size_t len) {
+    if (!buf || len == 0) return -1;
+    char exe[PATH_MAX];
+#if defined(__APPLE__)
+    char raw[PATH_MAX];
+    uint32_t raw_size = sizeof(raw);
+    if (_NSGetExecutablePath(raw, &raw_size) != 0) return -1;
+    if (!realpath(raw, exe)) return -1;
+#elif defined(__linux__)
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n <= 0) return -1;
+    exe[n] = '\0';
+    char resolved[PATH_MAX];
+    if (realpath(exe, resolved)) snprintf(exe, sizeof(exe), "%s", resolved);
+#else
+    (void)buf; (void)len; return -1;
+#endif
+    char *slash = strrchr(exe, '/');
+    if (!slash) return -1;
+    if (slash == exe) { /* executable sits at the filesystem root */
+        if (len < 2) return -1;
+        buf[0] = '/'; buf[1] = '\0';
+        return 0;
+    }
+    size_t dir_len = (size_t)(slash - exe);
+    if (dir_len >= len) return -1;
+    memcpy(buf, exe, dir_len);
+    buf[dir_len] = '\0';
+    return 0;
+}
+
+#ifndef DS4_NO_GPU
+/* Reason string captured from the most recent failed GPU command buffer.
+ * ds4_gpu_wait_command_buffer() records the backend error here so the session
+ * layer can thread it into the caller's error message.  This matters in the
+ * agent TUI: its ANSI scroll region can overwrite the backend's stderr line,
+ * leaving the user with only the generic "prefill failed" text.  Not thread
+ * safe by design -- prefill/decode run on a single worker thread. */
+static char g_ds4_gpu_last_error[256];
+
+void ds4_gpu_set_last_error(const char *msg) {
+    if (!msg || !msg[0]) { g_ds4_gpu_last_error[0] = '\0'; return; }
+    snprintf(g_ds4_gpu_last_error, sizeof(g_ds4_gpu_last_error), "%s", msg);
+}
+
+const char *ds4_gpu_last_error(void) { return g_ds4_gpu_last_error; }
+
+void ds4_gpu_clear_last_error(void) { g_ds4_gpu_last_error[0] = '\0'; }
+#endif /* !DS4_NO_GPU */
+
 static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt) {
         snprintf(err, errlen, "missing session or prompt");
@@ -58634,6 +58692,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 .user = s->progress,
                 .user_ud = s->progress_ud,
             };
+            ds4_gpu_clear_last_error();
             bool ok = metal_graph_prefill_chunked_range(&s->graph,
                                                         &e->model,
                                                         &e->weights,
@@ -58657,7 +58716,18 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             if (!ok) {
-                snprintf(err, errlen, "%s resumed prefill failed while extending checkpoint", backend_name);
+                const char *reason = ds4_gpu_last_error();
+                if (reason && reason[0]) {
+                    snprintf(err, errlen,
+                             "%s resumed prefill failed while extending checkpoint "
+                             "(pos %d, +%d tokens): %s",
+                             backend_name, s->checkpoint.len, suffix, reason);
+                } else {
+                    snprintf(err, errlen,
+                             "%s resumed prefill failed while extending checkpoint "
+                             "(pos %d, +%d tokens)",
+                             backend_name, s->checkpoint.len, suffix);
+                }
                 s->checkpoint_valid = false;
                 return 1;
             }
@@ -58667,6 +58737,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             return 0;
         }
 
+        ds4_gpu_clear_last_error();
         for (int i = s->checkpoint.len; i < prompt->len; i++) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
@@ -58679,7 +58750,17 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                                 (uint32_t)s->checkpoint.len,
                                                 s->logits))
             {
-                snprintf(err, errlen, "%s decode failed while extending checkpoint", backend_name);
+                const char *reason = ds4_gpu_last_error();
+                if (reason && reason[0]) {
+                    snprintf(err, errlen,
+                             "%s decode failed while extending checkpoint "
+                             "(pos %d): %s",
+                             backend_name, s->checkpoint.len, reason);
+                } else {
+                    snprintf(err, errlen,
+                             "%s decode failed while extending checkpoint (pos %d)",
+                             backend_name, s->checkpoint.len);
+                }
                 s->checkpoint_valid = false;
                 return 1;
             }
